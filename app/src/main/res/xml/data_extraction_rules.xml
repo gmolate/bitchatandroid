@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<data-extraction-rules>
+    <!--
+    TODO: Define data extraction rules for your application.
+        For more information, see https://developer.android.com/guide/topics/data/data-extraction-rules
+    -->
+    <cloud-backup>
+        <!-- TODO: Define what to include and exclude from cloud backups -->
+        <include domain="sharedpref" path="."/>
+        <exclude domain="sharedpref" path="ephemeral_data.xml"/>
+    </cloud-backup>
+    <device-transfer>
+        <!-- TODO: Define what to include and exclude from device-to-device transfers -->
+        <include domain="sharedpref" path="."/>
+        <exclude domain="sharedpref" path="ephemeral_data.xml"/>
+    </device-transfer>
+</data-extraction-rules>

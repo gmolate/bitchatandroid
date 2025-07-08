@@ -1,0 +1,65 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools"
+    package="com.example.bitchat">
+
+    <!-- Permissions -->
+    <!-- Bluetooth Permissions -->
+    <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
+    <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30" />
+    <!-- Required for API 31+ -->
+    <uses-permission android:name="android.permission.BLUETOOTH_SCAN" android:usesPermissionFlags="neverForLocation" />
+    <uses-permission android:name="android.permission.BLUETOOTH_ADVERTISE" />
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+
+    <!-- Location Permissions (ACCESS_FINE_LOCATION is needed for Bluetooth scanning on some Android versions) -->
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+
+    <!-- Foreground Service Permission -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+
+
+    <!-- Notification Permission (for API 33+) -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+
+    <!-- Declare features -->
+    <uses-feature android:name="android.hardware.bluetooth_le" android:required="true"/>
+
+    <application
+        android:allowBackup="true"
+        android:dataExtractionRules="@xml/data_extraction_rules"
+        android:fullBackupContent="@xml/backup_rules"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.BitChat"
+        tools:targetApi="31">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:label="@string/app_name"
+            android:theme="@style/Theme.BitChat">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- Bluetooth Mesh Service -->
+        <service
+            android:name=".services.BluetoothMeshService"
+            android:foregroundServiceType="connectedDevice"
+            android:exported="false" />
+
+        <!-- Notification Service (Example, might not be a separate service if handled by BluetoothMeshService or ViewModel) -->
+        <!--
+        <service
+            android:name=".services.UserNotificationService"
+            android:exported="false" />
+        -->
+
+    </application>
+
+</manifest>

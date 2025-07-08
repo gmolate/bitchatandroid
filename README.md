@@ -1,153 +1,76 @@
-![ChatGPT Image Jul 5, 2025 at 06_07_31 PM](https://github.com/user-attachments/assets/2660f828-49c7-444d-beca-d8b01854667a)
-# bitchat
+# BitChat - Android Port (In Progress)
 
-A secure, decentralized, peer-to-peer messaging app that works over Bluetooth mesh networks. No internet required, no servers, no phone numbers - just pure encrypted communication.
+This project is an Android port of the BitChat application, originally an iOS secure, decentralized, peer-to-peer messaging app using Bluetooth mesh networking.
 
-## License
+## Current Status
 
-This project is released into the public domain. See the [LICENSE](LICENSE) file for details.
+This port is currently under development. Core functionalities and services have been scaffolded, and initial UI components are in place. Key areas include:
 
-## Features
+*   **Bluetooth LE:** `BluetoothMeshService.kt` provides the foundation for scanning, advertising, and GATT server/client operations. It's designed to run as a Foreground Service. **Actual UUIDs need to be updated from the iOS version.**
+*   **Encryption:** `EncryptionService.kt` outlines methods for end-to-end encryption (X25519 key exchange, AES-GCM for messages, Ed25519 signatures, HKDF, PBKDF2). **Full BouncyCastle integration for reliable X25519/Ed25519 is a critical pending task.**
+*   **Protocol Handling:** `BitchatProtocol.kt` (with `BinaryProtocol` object) defines data structures (`BitchatPacket`, `BitchatMessage`) and outlines serialization/deserialization logic. **Placeholders for LZ4 compression and PKCS#7 padding need to be replaced with actual implementations.**
+*   **UI (Jetpack Compose):** `ChatScreen.kt` provides a basic chat interface with message display, input field, and runtime permission handling (Bluetooth, Location, Notifications).
+*   **ViewModel:** `ChatViewModel.kt` manages UI state using StateFlows and handles basic user interactions and command parsing.
+*   **Data Storage:** `DataStorageService.kt` uses Jetpack DataStore for user preferences and Android Keystore for secure storage of identity keys and wrapped channel keys.
+*   **Utilities:** `CompressionUtil.kt` (using lz4-java), `BloomFilterUtil.kt` (using Guava), `NotificationService.kt`, and `MessageMetadataService.kt` (for message tracking) have been created.
 
-- **Decentralized Mesh Network**: Automatic peer discovery and multi-hop message relay over Bluetooth LE
-- **End-to-End Encryption**: X25519 key exchange + AES-256-GCM for private messages
-- **Channel-Based Chats**: Topic-based group messaging with optional password protection
-- **Store & Forward**: Messages cached for offline peers and delivered when they reconnect
-- **Privacy First**: No accounts, no phone numbers, no persistent identifiers
-- **IRC-Style Commands**: Familiar `/join`, `/msg`, `/who` style interface
-- **Message Retention**: Optional channel-wide message saving controlled by channel owners
-- **Universal App**: Native support for iOS and macOS
-- **Cover Traffic**: Timing obfuscation and dummy messages for enhanced privacy
-- **Emergency Wipe**: Triple-tap to instantly clear all data
-- **Performance Optimizations**: LZ4 message compression, adaptive battery modes, and optimized networking
+## Architecture Overview (Android)
 
-## Setup
+The Android version aims to mirror the iOS architecture where sensible, adapting to Android best practices:
 
-### Option 1: Using XcodeGen (Recommended)
+*   **UI Layer:** Jetpack Compose (`ChatScreen.kt`, `MessageItem.kt`).
+*   **ViewModel Layer:** `ChatViewModel.kt` using Android Architecture Components (`AndroidViewModel`).
+*   **Service Layer:**
+    *   `BluetoothMeshService.kt`: Manages all BLE operations. Runs as a Foreground Service.
+    *   `EncryptionService.kt`: Handles cryptographic tasks.
+    *   `BitchatProtocol.kt` (with internal `BinaryProtocol` object): Defines message structures and handles serialization/deserialization.
+    *   `MessageMetadataService.kt`: Tracks message delivery status, ACKs, and basic retry logic.
+*   **Data Layer:**
+    *   `DataStorageService.kt`: Manages persistent data using Jetpack DataStore (for preferences, encrypted keys) and Android Keystore (for identity and wrapping keys).
+*   **Utilities (`utils` package & services):**
+    *   `CompressionUtil.kt` (for LZ4).
+    *   `BloomFilterUtil.kt` (for Guava BloomFilter).
+    *   `NotificationService.kt`.
 
-1. Install XcodeGen if you haven't already:
-   ```bash
-   brew install xcodegen
-   ```
+## Key Android-Specific Considerations Addressed
 
-2. Generate the Xcode project:
-   ```bash
-   cd bitchat
-   xcodegen generate
-   ```
+*   **Permissions:** Runtime handling for Bluetooth (SCAN, CONNECT, ADVERTISE), Fine Location, and Post Notifications (API 33+) is implemented in `ChatScreen.kt` using Accompanist Permissions. Manifest entries are in place.
+*   **Background Execution:** `BluetoothMeshService` is configured as a Foreground Service with a persistent notification.
+*   **Secure Storage:** Android Keystore is utilized by `DataStorageService` for cryptographic keys.
+*   **Modern Android Development Stack:** Kotlin, Jetpack Compose, Coroutines, Flow, AndroidX libraries, Jetpack DataStore.
+*   **SDK Versioning:** Targets API 34, minSdk 29. Version-specific checks are noted where necessary.
 
-3. Open the generated project:
-   ```bash
-   open bitchat.xcodeproj
-   ```
+## TODOs / Next Steps (High-Level from current development phase)
 
-### Option 2: Using Swift Package Manager
+1.  **Critical: Replace Placeholder UUIDs:** Update `BITCHAT_SERVICE_UUID` and `BITCHAT_CHARACTERISTIC_UUID` in `BluetoothMeshService.kt` with the actual UUIDs used by the iOS application to ensure interoperability.
+2.  **Finalize Cryptography Implementation (`EncryptionService.kt`):**
+    *   Fully integrate BouncyCastle for reliable X25519 key generation/agreement and Ed25519 signing/verification. Ensure the BouncyCastle provider is correctly initialized.
+    *   Implement secure shared secret management post-key-exchange (e.g., map peer IDs to derived shared secrets).
+    *   Ensure PBKDF2 for channel passwords is robust and salts are handled correctly.
+3.  **Complete Protocol Implementation (`BinaryProtocol` in `BitchatProtocol.kt`):**
+    *   Replace placeholder calls to `LZ4Util` and `PKCS7Util` with actual calls to `CompressionUtil.kt` and a proper PKCS#7 implementation (either custom or from a library if BouncyCastle provides a suitable one).
+    *   Ensure correct order of operations: (for sending private UserMessage) -> compress -> pad -> encrypt. (for receiving) -> decrypt -> unpad -> decompress.
+    *   Implement robust handling of `originalLength` for LZ4 decompression, or adapt to a streaming LZ4 format if the iOS app uses one.
+    *   Implement message fragmentation and reassembly within `BluetoothMeshService` if messages (after encryption/compression) exceed BLE MTU.
+4.  **Full Service Integration & Data Flow:**
+    *   Implement proper service binding in `MainActivity.kt` to connect to `BluetoothMeshService` and provide the instance to `ChatViewModel`.
+    *   Connect `ChatViewModel` to `BluetoothMeshService` to send/receive actual BLE data (serialized `BitchatMessage` payloads).
+    *   Integrate `MessageMetadataService` fully with `ChatViewModel` and `BluetoothMeshService` for reliable message status tracking and UI updates (e.g., delivery ticks).
+    *   Ensure `EncryptionService` is correctly used by `BinaryProtocol` and `ChatViewModel` (for channel password hashing).
+5.  **Refine UI and UX (`ChatScreen.kt` and new screens):**
+    *   Display message delivery/read statuses in `MessageItem`.
+    *   Implement UI for channel management: creating new channels (with optional password), joining existing channels (prompting for password if needed), listing available/joined channels.
+    *   (Optional for initial functional branch) Implement UI to display discovered/connected peers and their status.
+    *   (Optional) Add an application settings screen (e.g., for changing display name, managing identity key - though key management should be mostly automatic).
+6.  **Error Handling and Stability:**
+    *   Implement comprehensive error handling throughout all layers (BLE operations, crypto, serialization, UI).
+    *   Propagate errors gracefully to the UI via `ChatViewModel`.
+7.  **Thorough Testing:**
+    *   Expand unit tests for `EncryptionService` (with BouncyCastle), `BinaryProtocol` (with actual compression/padding), `DataStorageService` (with Robolectric/instrumented tests for Keystore/DataStore), and `MessageMetadataService`.
+    *   Develop integration tests for interactions between services (e.g., ViewModel sending a message through the stack).
+    *   Create UI tests using Jetpack Compose testing framework.
+    *   Test extensively on various Android devices (API 29-34) and different OEM skins.
+8.  **Battery Optimization:** Review and fine-tune BLE scan/advertising parameters and connection management in `BluetoothMeshService` for optimal battery life.
+9.  **Review ProGuard Rules:** Once dependencies like BouncyCastle are fully used, ensure ProGuard rules are adequate for release builds.
 
-1. Open the project in Xcode:
-   ```bash
-   cd bitchat
-   open Package.swift
-   ```
-
-2. Select your target device and run
-
-### Option 3: Manual Xcode Project
-
-1. Open Xcode and create a new iOS/macOS App
-2. Copy all Swift files from the `bitchat` directory into your project
-3. Update Info.plist with Bluetooth permissions
-4. Set deployment target to iOS 16.0 / macOS 13.0
-
-## Usage
-
-### Basic Commands
-
-- `/j #channel` - Join or create a channel
-- `/m @user message` - Send a private message
-- `/w` - List online users
-- `/channels` - Show all discovered channels
-- `/clear` - Clear chat messages
-- `/pass [password]` - Set/change channel password (owner only)
-- `/transfer @user` - Transfer channel ownership
-- `/save` - Toggle message retention for channel (owner only)
-
-### Getting Started
-
-1. Launch bitchat on your device
-2. Set your nickname (or use the auto-generated one)
-3. You'll automatically connect to nearby peers
-4. Join a channel with `/j #general` or start chatting in public
-5. Messages relay through the mesh network to reach distant peers
-
-### Channel Features
-
-- **Password Protection**: Channel owners can set passwords with `/pass`
-- **Message Retention**: Owners can enable mandatory message saving with `/save`
-- **@ Mentions**: Use `@nickname` to mention users (with autocomplete)
-- **Ownership Transfer**: Pass control to trusted users with `/transfer`
-
-## Security & Privacy
-
-### Encryption
-- **Private Messages**: X25519 key exchange + AES-256-GCM encryption
-- **Channel Messages**: Argon2id password derivation + AES-256-GCM
-- **Digital Signatures**: Ed25519 for message authenticity
-- **Forward Secrecy**: New key pairs generated each session
-
-### Privacy Features
-- **No Registration**: No accounts, emails, or phone numbers required
-- **Ephemeral by Default**: Messages exist only in device memory
-- **Cover Traffic**: Random delays and dummy messages prevent traffic analysis
-- **Emergency Wipe**: Triple-tap logo to instantly clear all data
-- **Local-First**: Works completely offline, no servers involved
-
-## Performance & Efficiency
-
-### Message Compression
-- **LZ4 Compression**: Automatic compression for messages >100 bytes
-- **30-70% bandwidth savings** on typical text messages
-- **Smart compression**: Skips already-compressed data
-
-### Battery Optimization
-- **Adaptive Power Modes**: Automatically adjusts based on battery level
-  - Performance mode: Full features when charging or >60% battery
-  - Balanced mode: Default operation (30-60% battery)
-  - Power saver: Reduced scanning when <30% battery
-  - Ultra-low power: Emergency mode when <10% battery
-- **Background efficiency**: Automatic power saving when app backgrounded
-- **Configurable scanning**: Duty cycle adapts to battery state
-
-### Network Efficiency
-- **Optimized Bloom filters**: Faster duplicate detection with less memory
-- **Message aggregation**: Batches small messages to reduce transmissions
-- **Adaptive connection limits**: Adjusts peer connections based on power mode
-
-## Technical Architecture
-
-### Binary Protocol
-bitchat uses an efficient binary protocol optimized for Bluetooth LE:
-- Compact packet format with 1-byte type field
-- TTL-based message routing (max 7 hops)
-- Automatic fragmentation for large messages
-- Message deduplication via unique IDs
-
-### Mesh Networking
-- Each device acts as both client and peripheral
-- Automatic peer discovery and connection management
-- Store-and-forward for offline message delivery
-- Adaptive duty cycling for battery optimization
-
-For detailed protocol documentation, see the [Technical Whitepaper](WHITEPAPER.md).
-
-## Building for Production
-
-1. Set your development team in project settings
-2. Configure code signing
-3. Archive and distribute through App Store or TestFlight
-
-## Android Compatibility
-
-The protocol is designed to be platform-agnostic. An Android client can be built using:
-- Bluetooth LE APIs
-- Same packet structure and encryption
-- Compatible service/characteristic UUIDs
+This `README.md` provides a snapshot of the project's state and direction. It will be updated as development continues.

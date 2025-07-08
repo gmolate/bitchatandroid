@@ -1,0 +1,100 @@
+plugins {
+    id 'com.android.application'
+    id 'org.jetbrains.kotlin.android'
+    id 'kotlin-parcelize' // For @Parcelize annotation if needed for model classes
+}
+
+android {
+    namespace 'com.example.bitchat'
+    compileSdk 34 // Target Android API level 34 (Android 14)
+
+    defaultConfig {
+        applicationId "com.example.bitchat"
+        minSdk 29 // Minimum API level 29 (Android 10)
+        targetSdk 34
+        versionCode 1
+        versionName "1.0"
+
+        testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+        vectorDrawables {
+            useSupportLibrary true
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false // Consider enabling for production
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+        debug {
+            applicationIdSuffix ".debug"
+            debuggable true
+        }
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+    kotlinOptions {
+        jvmTarget = '1.8'
+    }
+    buildFeatures {
+        compose true
+    }
+    composeOptions {
+        kotlinCompilerExtensionVersion '1.5.10' // Ensure compatibility with Kotlin version
+    }
+    packagingOptions {
+        resources {
+            excludes += '/META-INF/{AL2.0,LGPL2.1}'
+        }
+    }
+}
+
+dependencies {
+    implementation "androidx.core:core-ktx:$coreKtxVersion"
+    implementation "androidx.lifecycle:lifecycle-runtime-ktx:$lifecycleRuntimeKtxVersion"
+    implementation "androidx.activity:activity-compose:$activityComposeVersion"
+
+    // Jetpack Compose
+    implementation platform("androidx.compose:compose-bom:$composeBomVersion")
+    implementation "androidx.compose.ui:ui"
+    implementation "androidx.compose.ui:ui-graphics"
+    implementation "androidx.compose.ui:ui-tooling-preview"
+    implementation "androidx.compose.material3:material3" // Material Design 3 components
+    implementation "androidx.compose.material:material-icons-core"
+    implementation "androidx.compose.material:material-icons-extended"
+    implementation "androidx.lifecycle:lifecycle-viewmodel-compose:$lifecycleRuntimeKtxVersion"
+
+
+    // Coroutines for asynchronous programming
+    implementation "org.jetbrains.kotlinx:kotlinx-coroutines-core:$coroutinesVersion"
+    implementation "org.jetbrains.kotlinx:kotlinx-coroutines-android:$coroutinesVersion"
+
+    // DataStore for SharedPreferences alternative
+    implementation "androidx.datastore:datastore-preferences:$datastoreVersion"
+
+    // Security (for Keystore and potentially crypto if not using BouncyCastle directly)
+    implementation "androidx.security:security-crypto:1.1.0-alpha06" // Check for latest stable
+
+    // TODO: Add BouncyCastle dependency if needed for specific crypto operations (e.g., Ed25519)
+    // BouncyCastle for advanced cryptography (like Ed25519, X25519 if not well supported by default JCE)
+    implementation "org.bouncycastle:bcprov-jdk18on:1.78" // Use latest stable, ensure it's Android compatible (jdk18on is generally fine)
+    implementation "org.bouncycastle:bcpkix-jdk18on:1.78"
+
+    // LZ4 for compression
+    implementation "org.lz4:lz4-java:1.8.0"
+
+    // Guava for BloomFilter and other utilities
+    implementation "com.google.guava:guava:33.0.0-android" // Use latest Android compatible version
+
+
+    // Testing
+    testImplementation "junit:junit:$junitVersion"
+    androidTestImplementation "androidx.test.ext:junit:$androidxTestExtJunitVersion"
+    androidTestImplementation "androidx.test.espresso:espresso-core:$espressoCoreVersion"
+    androidTestImplementation platform("androidx.compose:compose-bom:$composeBomVersion")
+    androidTestImplementation "androidx.compose.ui:ui-test-junit4"
+    debugImplementation "androidx.compose.ui:ui-tooling"
+    debugImplementation "androidx.compose.ui:ui-test-manifest"
+}

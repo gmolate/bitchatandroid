@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<full-backup-content>
+    <!-- TODO: Define backup rules for your application.
+         For more information, see https://developer.android.com/guide/topics/data/autobackup -->
+    <exclude domain="database" path="bitchat_keystore.jks"/> <!-- Example: Exclude a keystore file -->
+    <exclude domain="sharedpref" path="ephemeral_data.xml"/> <!-- Example: Exclude specific shared prefs -->
+</full-backup-content>
