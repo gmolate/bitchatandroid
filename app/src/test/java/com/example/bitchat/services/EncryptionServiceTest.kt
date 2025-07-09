@@ -31,21 +31,31 @@ class EncryptionServiceTest {
     fun generateX25519KeyPair_successful() {
         val keyPair = encryptionService.generateX25519KeyPair()
         assertNotNull("X25519 key pair should not be null", keyPair)
-        assertNotNull("X25519 public key should not be null", keyPair?.public)
-        assertNotNull("X25519 private key should not be null", keyPair?.private)
-        // Algorithm check depends on BC's naming, could be "XDH" or "X25519"
-        assertTrue("Public key algorithm should indicate X25519 compatibility", keyPair!!.public.algorithm.contains("XDH", ignoreCase = true) ||  keyPair.public.algorithm.contains("X25519", ignoreCase = true) )
-        assertTrue("Private key algorithm should indicate X25519 compatibility", keyPair.private.algorithm.contains("XDH", ignoreCase = true) ||  keyPair.private.algorithm.contains("X25519", ignoreCase = true))
+        keyPair?.let {
+            assertNotNull("X25519 public key should not be null", it.public)
+            assertNotNull("X25519 private key should not be null", it.private)
+            // BouncyCastle might return "X25519" or "XDH" depending on how it's obtained
+            assertTrue(
+                "Public key algorithm should be X25519 or XDH, was ${it.public.algorithm}",
+                it.public.algorithm.equals(EncryptionService.BC_ALGORITHM_X25519, ignoreCase = true) || it.public.algorithm.equals("XDH", ignoreCase = true)
+            )
+            assertTrue(
+                "Private key algorithm should be X25519 or XDH, was ${it.private.algorithm}",
+                it.private.algorithm.equals(EncryptionService.BC_ALGORITHM_X25519, ignoreCase = true) || it.private.algorithm.equals("XDH", ignoreCase = true)
+            )
+        }
     }
 
     @Test
     fun generateEd25519KeyPair_successful() {
         val keyPair = encryptionService.generateEd25519KeyPair()
         assertNotNull("Ed25519 key pair should not be null", keyPair)
-        assertNotNull("Ed25519 public key should not be null", keyPair?.public)
-        assertNotNull("Ed25519 private key should not be null", keyPair?.private)
-        assertEquals("EdDSA", keyPair!!.public.algorithm) // EdDSA is the umbrella, Ed25519 is the curve
-        assertEquals("EdDSA", keyPair.private.algorithm)
+        keyPair?.let {
+            assertNotNull("Ed25519 public key should not be null", it.public)
+            assertNotNull("Ed25519 private key should not be null", it.private)
+            assertEquals("Algorithm for Ed25519 public key should be EdDSA (or Ed25519 via BC)", EncryptionService.BC_ALGORITHM_ED25519, it.public.algorithm)
+            assertEquals("Algorithm for Ed25519 private key should be EdDSA (or Ed25519 via BC)", EncryptionService.BC_ALGORITHM_ED25519, it.private.algorithm)
+        }
     }
 
     // --- Key Agreement Test (X25519 with BouncyCastle) ---
@@ -53,7 +63,8 @@ class EncryptionServiceTest {
     fun performKeyAgreement_X25519_successful() {
         val keyPairA = encryptionService.generateX25519KeyPair()
         val keyPairB = encryptionService.generateX25519KeyPair()
-        assertNotNull(keyPairA); assertNotNull(keyPairB)
+        assertNotNull("KeyPair A for agreement test should not be null", keyPairA)
+        assertNotNull("KeyPair B for agreement test should not be null", keyPairB)
 
         val secretA = encryptionService.performKeyAgreement(keyPairA!!.private, keyPairB!!.public)
         val secretB = encryptionService.performKeyAgreement(keyPairB.private, keyPairA.public)
@@ -61,7 +72,7 @@ class EncryptionServiceTest {
         assertNotNull("Shared secret A should not be null", secretA)
         assertNotNull("Shared secret B should not be null", secretB)
         assertArrayEquals("Shared secrets derived by both parties should be identical", secretA, secretB)
-        assertTrue("Shared secret should have a reasonable length (e.g., 32 bytes for X25519)", secretA!!.size == 32)
+        assertEquals("Shared secret for X25519 should be 32 bytes", 32, secretA?.size)
     }
 
     // --- Ed25519 Signature Tests (with BouncyCastle) ---
@@ -96,11 +107,12 @@ class EncryptionServiceTest {
         val data = "Data for tampered signature test".toByteArray()
 
         val signature = encryptionService.signEd25519(data, keyPair.private)!!
-        if (signature.isNotEmpty()) {
-            signature[signature.size / 2] = (signature[signature.size / 2] + 1).toByte() // Tamper signature
-        } else {
-            fail("Signature was empty, cannot tamper.")
+        // Ensure signature is not empty before tampering
+        if (signature.isEmpty()) {
+            fail("Generated signature was empty, cannot tamper.")
         }
+        signature[signature.size / 2] = (signature[signature.size / 2].toInt() xor 0xFF).toByte() // Tamper signature byte
+
         val isValid = encryptionService.verifyEd25519(data, signature, keyPair.public)
         assertFalse("Verification with tampered signature should fail", isValid)
     }
@@ -117,7 +129,7 @@ class EncryptionServiceTest {
     }
 
 
-    // --- HKDF Tests (should remain largely the same) ---
+    // --- HKDF Tests (should remain largely the same, as it uses standard JCE HMAC) ---
     @Test
     fun hkdf_derivesKeyOfCorrectLength() {
         val ikm = "InitialKeyMaterial".toByteArray()
