@@ -27,10 +27,6 @@ ext {
     // Placeholder for LZ4, e.g., 'org.lz4:lz4-java:1.8.0'
 }
 
-allprojects {
-    repositories {
-        google()
-        mavenCentral()
-        // Potentially other repositories like JitPack if needed
-    }
-}
+// The 'allprojects' repositories block has been removed.
+// Repository configuration is now centralized in settings.gradle's
+// dependencyResolutionManagement block to comply with RepositoriesMode.FAIL_ON_PROJECT_REPOS.

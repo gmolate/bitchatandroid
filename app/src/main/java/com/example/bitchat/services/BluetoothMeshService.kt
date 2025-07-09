@@ -273,15 +273,23 @@ class BluetoothMeshService : Service() {
             Log.i(TAG, "Scan Result: ${device.address} - Name: ${device.name ?: "N/A"}, RSSI: ${result.rssi}")
             // TODO: Process scan result - e.g., add to a list of discovered peers, attempt connection
             // For now, just log it. Later, we'll connect to it.
-            // connectToDevice(device)
+            // Example: if suitable conditions met: connectToDevice(device)
         }
 
         override fun onBatchScanResults(results: List<ScanResult>) {
             super.onBatchScanResults(results)
             Log.i(TAG, "Batch Scan Results: ${results.size} devices found")
             results.forEach { result ->
-                Log.i(TAG, "  Device: ${result.device.address} - Name: ${result.device.name ?: "N/A"}")
+                 val deviceName = if (ActivityCompat.checkSelfPermission(this@BluetoothMeshService, Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED) {
+                    result.device.name ?: "N/A" // Attempt to get name if permission allows
+                } else {
+                    "N/A (No Connect Perm)" // Indicate permission issue if name cannot be retrieved
+                }
+                Log.i(TAG, "  Device: Addr=${result.device.address}, Name=$deviceName, RSSI=${result.rssi}")
             }
+            // TODO: Process batch results similarly to individual onScanResult. This involves:
+            //  - Adding new/updated peer info to a central peer manager/list.
+            //  - Potentially triggering connection attempts based on strategy.
         }
 
         override fun onScanFailed(errorCode: Int) {
