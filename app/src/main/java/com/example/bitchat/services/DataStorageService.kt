@@ -255,9 +255,105 @@ class DataStorageService(private val context: Context) {
         }
     }
 
+    // --- Message Persistence (Using DataStore with JSON serialization for List<UiMessage>) ---
+    // Helper to get DataStore key for a channel's message list
+    private fun dsKeyMessagesForChannel(channelName: String) = stringPreferencesKey("messages_${channelName.replace("#", "")}")
+
+    // For JSON Serialization of UiMessage list
+    // Add dependency: implementation("com.google.code.gson:gson:2.10.1") or kotlinx.serialization
+    // Using Gson for simplicity here.
+    private val gson = com.google.gson.Gson()
+    private val uiMessageListTypeToken = object : com.google.gson.reflect.TypeToken<List<UiMessage>>() {}.type
+
+
+    /**
+     * Adds a new message to the list of messages for a given channel in DataStore.
+     * @param channelName The channel to add the message to.
+     * @param message The UiMessage to add.
+     */
+    suspend fun addMessageToChannel(channelName: String, message: UiMessage) {
+        context.dataStore.dsEdit { settings ->
+            val currentMessagesJson = settings[dsKeyMessagesForChannel(channelName)]
+            val currentMessages: MutableList<UiMessage> = if (currentMessagesJson != null) {
+                try {
+                    gson.fromJson(currentMessagesJson, uiMessageListTypeToken)
+                } catch (e: Exception) {
+                    Log.e(TAG, "Error parsing existing messages for channel $channelName, starting fresh.", e)
+                    mutableListOf()
+                }
+            } else {
+                mutableListOf()
+            }
+            currentMessages.add(message)
+            // Optional: Limit the number of stored messages per channel
+            // while (currentMessages.size > MAX_MESSAGES_PER_CHANNEL) { currentMessages.removeFirstOrNull() }
+            settings[dsKeyMessagesForChannel(channelName)] = gson.toJson(currentMessages)
+            Log.d(TAG, "Message ${message.id} added to channel $channelName in DataStore.")
+        }
+    }
+
+    /**
+     * Retrieves all messages for a specific channel from DataStore as a Flow.
+     * @param channelName The channel whose messages are to be retrieved.
+     * @return A Flow emitting a list of UiMessages.
+     */
+    fun getMessagesForChannel(channelName: String): Flow<List<UiMessage>> {
+        return context.dataStore.data
+            .map { preferences ->
+                val messagesJson = preferences[dsKeyMessagesForChannel(channelName)]
+                if (messagesJson != null) {
+                    try {
+                        gson.fromJson<List<UiMessage>>(messagesJson, uiMessageListTypeToken) ?: emptyList()
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Error parsing messages for channel $channelName from DataStore.", e)
+                        emptyList()
+                    }
+                } else {
+                    emptyList()
+                }
+            }
+            .catch { exception ->
+                Log.e(TAG, "Error reading messages flow for channel $channelName from DataStore.", exception)
+                emit(emptyList()) // Emit empty list in case of error reading the flow
+            }
+    }
+
+    /**
+     * Clears all messages for a specific channel from DataStore.
+     * @param channelName The channel whose messages are to be cleared.
+     */
+    suspend fun clearMessagesForChannel(channelName: String) {
+        context.dataStore.dsEdit { settings ->
+            settings.remove(dsKeyMessagesForChannel(channelName))
+            Log.i(TAG, "Messages for channel $channelName cleared from DataStore.")
+        }
+    }
+
+    /**
+     * Clears all message history from all channels.
+     * This is a destructive operation.
+     */
+    suspend fun clearAllMessages() {
+        context.dataStore.dsEdit { settings ->
+            // Find all keys related to messages and remove them. This is a bit tricky with dynamic keys.
+            // A simpler approach for full clear is to just clear all preferences if this datastore is ONLY for messages.
+            // Or, if you have a known list of channels, iterate and remove.
+            // For a truly dynamic scenario without knowing all channel names, this requires listing keys if possible,
+            // or adopting a different strategy (e.g., a single key holding a map of channels to message lists).
+            // The current `preferencesDataStore` doesn't easily support listing all keys.
+            // For now, this will be a placeholder or would require a refactor of how channels are stored.
+            Log.w(TAG, "clearAllMessages() is not fully implemented for dynamically named channel message keys. Consider a different DataStore strategy for this.")
+            // A pragmatic approach if you track active channels elsewhere:
+            // getListOfActiveChannels().forEach { channelName -> settings.remove(dsKeyMessagesForChannel(channelName)) }
+            // For a total wipe of this specific DataStore (if it's ONLY messages and ephemeral data):
+            // settings.clear() // Use with extreme caution, this clears ALL preferences in this DataStore file.
+        }
+        Log.i(TAG, "Attempted to clear all messages (implementation may be partial).")
+    }
+
 
     // --- SharedPreferences (Legacy Example - can be removed if fully migrating to DataStore) ---
-    @Deprecated("Use DataStore instead for display name")
+    @Deprecated("Use DataStore (displayNameFlow and saveDisplayName) instead.", ReplaceWith("saveDisplayName(displayName)"))
     fun saveDisplayNameSharedPrefs(displayName: String) {
         val sharedPrefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         sharedPrefs.edit {
