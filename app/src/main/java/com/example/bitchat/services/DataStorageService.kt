@@ -3,197 +3,162 @@ package com.example.bitchat.services
 import android.content.Context
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
-import androidx.core.content.edit
+import android.util.Base64 // Using android.util.Base64 for consistency
+import android.util.Log
 import androidx.datastore.core.DataStore
 import androidx.datastore.preferences.core.Preferences
-import androidx.datastore.preferences.core.edit as dsEdit // Alias for DataStore edit, to avoid conflict with SharedPreferences.edit
+import androidx.datastore.preferences.core.edit as dsEdit
+import androidx.datastore.preferences.core.emptyPreferences
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
+import com.example.bitchat.viewmodel.UiMessage // Assuming UiMessage is in viewmodel package
+import com.google.gson.Gson
+import com.google.gson.reflect.TypeToken
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.firstOrNull
 import kotlinx.coroutines.flow.map
-import java.io.ByteArrayInputStream
-import java.io.ByteArrayOutputStream
+import java.io.IOException
 import java.security.KeyPair
+import java.security.KeyPairGenerator // Added for Identity Key generation directly in Keystore
 import java.security.KeyStore
 import java.security.PrivateKey
 import java.security.PublicKey
 import javax.crypto.Cipher
+import javax.crypto.KeyGenerator // Added for Channel Wrapping Key generation
 import javax.crypto.SecretKey
 import javax.crypto.spec.GCMParameterSpec
+import javax.crypto.spec.SecretKeySpec
+import java.util.concurrent.ConcurrentHashMap
 
-// Create a DataStore instance at the top level of your Kotlin file.
-val Context.dataStore: DataStore<Preferences> by preferencesDataStore(name = "bitchat_settings")
+
+val Context.dataStore: DataStore<Preferences> by preferencesDataStore(name = "bitchat_settings_v2") // v2 for safety with new structures
 
 class DataStorageService(private val context: Context) {
 
     companion object {
-        private const val TAG = "DataStorageService"
+        private const val TAG = "BitChatDataStore" // Consistent TAG prefix
 
-        // SharedPreferences (Legacy, can be replaced entirely by DataStore)
-        private const val PREFS_NAME = "bitchat_shared_prefs"
-        private const val KEY_DISPLAY_NAME = "display_name"
+        val DISPLAY_NAME_DS_KEY = stringPreferencesKey("display_name_ds_v2")
+        val USER_EPHEMERAL_ID_DS_KEY = stringPreferencesKey("user_ephemeral_id_ds_v2")
+        val PEER_PUBLIC_KEYS_DS_KEY = stringPreferencesKey("peer_public_keys_map_v3")
 
-        // DataStore Keys
-        val DISPLAY_NAME_DS_KEY = stringPreferencesKey("display_name_ds")
-        val USER_EPHEMERAL_ID_DS_KEY = stringPreferencesKey("user_ephemeral_id_ds")
-        // Add other DataStore keys as needed
-
-        // Android Keystore Alias
         private const val ANDROID_KEYSTORE_PROVIDER = "AndroidKeyStore"
-        private const val IDENTITY_KEY_ALIAS = "BitChat_UserIdentityKey" // For Ed25519 persistent key
-        private const val CHANNEL_PASSWORD_KEY_ALIAS_PREFIX = "BitChat_ChannelKey_" // For AES keys derived from channel passwords
+        private const val IDENTITY_KEY_ALIAS = "BitChat_UserIdentityKey_Ed25519_v2"
+        private const val CHANNEL_PASSWORD_KEY_ALIAS_PREFIX = "BitChat_ChannelWrapKey_"
 
-        // Keystore Cipher Transformation for symmetric keys (used for channel passwords)
-        // Note: Android Keystore encryption for arbitrary data is more complex than just storing a raw key.
-        // It often involves generating a key in Keystore, then using that key to encrypt/decrypt data.
-        // For storing channel passwords, we might store an *encrypted version* of a hash, or a derived key.
-        // For simplicity here, we'll show storing an AES key used to encrypt the password hash itself,
-        // or directly storing a key derived from PBKDF2 and protected by Keystore.
         private const val KEYSTORE_AES_GCM_TRANSFORMATION = "AES/GCM/NoPadding"
-        private const val KEYSTORE_IV_SEPARATOR = "_IV_"
     }
 
-    // --- Display Name (using DataStore) ---
+    private val gson = Gson()
+    private val uiMessageListTypeToken = object : TypeToken<List<UiMessage>>() {}.type
+    private val peerPublicKeysMapTypeToken = object : TypeToken<Map<String, String>>() {}.type
+
+    private val peerPublicKeysCache = ConcurrentHashMap<String, ByteArray>()
+    private val channelKeyCache = ConcurrentHashMap<String, SecretKey>() // Cache for decrypted channel keys
+
+    // --- User Preferences ---
     val displayNameFlow: Flow<String?> = context.dataStore.data
-        .map { preferences ->
-            preferences[DISPLAY_NAME_DS_KEY]
+        .catch { exception ->
+            Log.e(TAG, "Error reading displayNameFlow from DataStore.", exception)
+            if (exception is IOException) emit(emptyPreferences()) else throw exception
         }
+        .map { preferences -> preferences[DISPLAY_NAME_DS_KEY] }
 
     suspend fun saveDisplayName(displayName: String) {
-        context.dataStore.dsEdit { settings ->
-            settings[DISPLAY_NAME_DS_KEY] = displayName
-        }
-        Log.d(TAG, "Display name saved to DataStore.")
+        Log.d(TAG, "Saving display name: '$displayName'")
+        context.dataStore.dsEdit { settings -> settings[DISPLAY_NAME_DS_KEY] = displayName }
+        Log.i(TAG, "Display name '$displayName' saved to DataStore.")
     }
 
-    // --- User Ephemeral ID (using DataStore, example) ---
-     val userEphemeralIdFlow: Flow<String?> = context.dataStore.data
-        .map { preferences ->
-            preferences[USER_EPHEMERAL_ID_DS_KEY]
+    val userEphemeralIdFlow: Flow<String?> = context.dataStore.data
+        .catch { exception ->
+            Log.e(TAG, "Error reading userEphemeralIdFlow from DataStore.", exception)
+            if (exception is IOException) emit(emptyPreferences()) else throw exception
         }
+        .map { preferences -> preferences[USER_EPHEMERAL_ID_DS_KEY] }
+
     suspend fun saveUserEphemeralId(ephemeralId: String) {
-        context.dataStore.dsEdit { settings ->
-            settings[USER_EPHEMERAL_ID_DS_KEY] = ephemeralId
-        }
-        Log.d(TAG, "User ephemeral ID saved to DataStore.")
-    }
-    suspend fun getUserEphemeralId(): String? {
-        return userEphemeralIdFlow.firstOrNull()
+        Log.d(TAG, "Saving user ephemeral ID: '$ephemeralId'")
+        context.dataStore.dsEdit { settings -> settings[USER_EPHEMERAL_ID_DS_KEY] = ephemeralId }
+        Log.i(TAG, "User ephemeral ID '$ephemeralId' saved to DataStore.")
     }
 
+    suspend fun getUserEphemeralId(): String? {
+        Log.d(TAG, "Getting user ephemeral ID from DataStore.")
+        val id = userEphemeralIdFlow.firstOrNull()
+        Log.d(TAG, "User ephemeral ID from DataStore: ${id ?: "Not found"}")
+        return id
+    }
 
     // --- Persistent Identity Key (Ed25519 using Android Keystore) ---
-
     fun getOrGenerateIdentityKeyPair(): KeyPair? {
+        Log.d(TAG, "Attempting to get or generate Ed25519 identity key pair from Android Keystore (Alias: $IDENTITY_KEY_ALIAS).")
         try {
-            val keyStore = KeyStore.getInstance(ANDROID_KEYSTORE_PROVIDER)
-            keyStore.load(null)
-
+            val keyStore = KeyStore.getInstance(ANDROID_KEYSTORE_PROVIDER).apply { load(null) }
             val privateKey = keyStore.getKey(IDENTITY_KEY_ALIAS, null) as? PrivateKey
             val publicKey = keyStore.getCertificate(IDENTITY_KEY_ALIAS)?.publicKey
 
             if (privateKey != null && publicKey != null) {
-                Log.d(TAG, "Identity key pair loaded from Keystore.")
+                Log.i(TAG, "Ed25519 identity key pair loaded from Keystore. PubKey Algo: ${publicKey.algorithm}")
                 return KeyPair(publicKey, privateKey)
             } else {
-                Log.d(TAG, "Identity key pair not found in Keystore, generating new one.")
-                // For Ed25519, KeyPairGenerator might need BouncyCastle or specific Android version
+                Log.i(TAG, "Identity key pair not found in Keystore. Generating new Ed25519 key pair.")
                 val kpg = KeyPairGenerator.getInstance(KeyProperties.KEY_ALGORITHM_EC, ANDROID_KEYSTORE_PROVIDER)
                 val parameterSpec = KeyGenParameterSpec.Builder(
                     IDENTITY_KEY_ALIAS,
                     KeyProperties.PURPOSE_SIGN or KeyProperties.PURPOSE_VERIFY
                 ).run {
-                    // For Ed25519, a specific curve name or size might be needed.
-                    // KeyProperties.KEY_ALGORITHM_EC with an EdDSA signature scheme implies an EdDSA-compatible curve.
+                    // For Ed25519, KeyProperties.KEY_ALGORITHM_EC with EdDSA signature scheme is used.
                     // Android P (API 28) added support for Ed25519.
-                    // If using BouncyCastle to generate, you'd import it differently.
-                    // This example relies on Android Keystore's EC capabilities which should support Ed25519 on API 28+.
-                    // setAlgorithmParameterSpec(ECGenParameterSpec("ed25519")) // This might be needed with some JCE setups
-                    setDigests(KeyProperties.DIGEST_NONE) // EdDSA typically includes the hash
-                    // No setKeySize for Ed25519 as it's fixed.
+                    // No explicit curve needed if KeyPairGenerator with "AndroidKeyStore" handles "EC" for Ed25519.
+                    // setAlgorithmParameterSpec(EdDSAParameterSpec(EdDSAParameterSpec.ED25519)) // Might be needed if using BC directly
+                    setDigests(KeyProperties.DIGEST_NONE) // EdDSA performs its own hashing
                     build()
                 }
                 kpg.initialize(parameterSpec)
                 val kp = kpg.generateKeyPair()
-                Log.d(TAG, "New identity key pair generated and stored in Keystore.")
+                Log.i(TAG, "New Ed25519 identity key pair generated and stored in Keystore. PubKey Algo: ${kp.public.algorithm}")
                 return kp
             }
         } catch (e: Exception) {
-            Log.e(TAG, "Error accessing or generating identity key pair: ${e.message}", e)
+            Log.e(TAG, "Error accessing or generating Ed25519 identity key pair: ${e.message}", e)
             return null
         }
     }
 
-    fun getIdentityPublicKey(): PublicKey? {
-         try {
-            val keyStore = KeyStore.getInstance(ANDROID_KEYSTORE_PROVIDER)
-            keyStore.load(null)
-            return keyStore.getCertificate(IDENTITY_KEY_ALIAS)?.publicKey
-        } catch (e: Exception) {
-            Log.e(TAG, "Error retrieving identity public key: ${e.message}", e)
-            return null
-        }
-    }
-     fun getIdentityPrivateKey(): PrivateKey? {
-         try {
-            val keyStore = KeyStore.getInstance(ANDROID_KEYSTORE_PROVIDER)
-            keyStore.load(null)
-            return keyStore.getKey(IDENTITY_KEY_ALIAS, null) as? PrivateKey
-        } catch (e: Exception) {
-            Log.e(TAG, "Error retrieving identity private key: ${e.message}", e)
-            return null
-        }
-    }
-
-
-    // --- Channel Password Derived Key Storage (AES key in Keystore) ---
-    // This is a simplified example. In a real app, you'd use the derived key from PBKDF2
-    // and potentially encrypt that derived key with a Keystore master key, or store the
-    // PBKDF2 parameters and re-derive as needed, only storing the salt.
-    // For simplicity, we'll simulate storing a key directly if Keystore allowed it,
-    // or more practically, generating an AES key in Keystore to encrypt the *actual* channel key.
-
-    /**
-     * Stores an AES key (e.g., derived from a channel password via PBKDF2)
-     * by encrypting it with a master key in Android Keystore.
-     * This is more secure than storing the raw key directly in SharedPreferences.
-     */
+    // --- Channel Password Derived Key Storage (AES key wrapping in Keystore) ---
     fun saveChannelKey(channelName: String, keyToProtect: SecretKey): Boolean {
         val alias = CHANNEL_PASSWORD_KEY_ALIAS_PREFIX + channelName.hashCode().toString()
+        Log.d(TAG, "Saving channel key for '$channelName' using Keystore alias '$alias'. Key to protect length: ${keyToProtect.encoded.size}B")
         try {
-            val keyStore = KeyStore.getInstance(ANDROID_KEYSTORE_PROVIDER)
-            keyStore.load(null)
-
-            // Generate a wrapping key in Keystore if it doesn't exist
+            val keyStore = KeyStore.getInstance(ANDROID_KEYSTORE_PROVIDER).apply { load(null) }
             if (!keyStore.containsAlias(alias)) {
-                val keyGenerator = KeyGenerator.getInstance(
-                    KeyProperties.KEY_ALGORITHM_AES,
-                    ANDROID_KEYSTORE_PROVIDER
-                )
+                Log.d(TAG, "Wrapping key for alias '$alias' not found, generating new AES-256 GCM key in Keystore.")
+                val keyGenerator = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, ANDROID_KEYSTORE_PROVIDER)
                 val spec = KeyGenParameterSpec.Builder(alias, KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT)
                     .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
                     .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
                     .setKeySize(256)
                     .build()
                 keyGenerator.init(spec)
-                keyGenerator.generateKey() // This key stays in Keystore
+                keyGenerator.generateKey()
+                Log.i(TAG, "New wrapping key generated for alias '$alias'.")
             }
 
-            val keystoreKey = keyStore.getKey(alias, null) as SecretKey
-
-            val cipher = Cipher.getInstance(KEYSTORE_AES_GCM_TRANSFORMATION) // Provider might be specified for GCM
-            cipher.init(Cipher.ENCRYPT_MODE, keystoreKey) // IV is generated by Cipher
+            val keystoreWrappingKey = keyStore.getKey(alias, null) as SecretKey
+            val cipher = Cipher.getInstance(KEYSTORE_AES_GCM_TRANSFORMATION)
+            cipher.init(Cipher.ENCRYPT_MODE, keystoreWrappingKey) // IV is generated by Cipher for encryption
 
             val encryptedKey = cipher.doFinal(keyToProtect.encoded)
             val iv = cipher.iv
 
-            // Store encrypted key and IV in SharedPreferences or DataStore
             context.dataStore.dsEdit { settings ->
-                settings[stringPreferencesKey("enc_channel_key_$channelName")] = android.util.Base64.encodeToString(encryptedKey, android.util.Base64.NO_WRAP)
-                settings[stringPreferencesKey("enc_channel_iv_$channelName")] = android.util.Base64.encodeToString(iv, android.util.Base64.NO_WRAP)
+                settings[stringPreferencesKey("enc_channel_key_b64_$channelName")] = Base64.encodeToString(encryptedKey, Base64.NO_WRAP)
+                settings[stringPreferencesKey("enc_channel_iv_b64_$channelName")] = Base64.encodeToString(iv, Base64.NO_WRAP)
             }
-            Log.d(TAG, "Channel key for '$channelName' encrypted and stored.")
+            Log.i(TAG, "Channel key for '$channelName' (size ${keyToProtect.encoded.size}B) encrypted (to ${encryptedKey.size}B with ${iv.size}B IV) and stored.")
+            channelKeyCache[channelName] = keyToProtect // Cache the original key
             return true
         } catch (e: Exception) {
             Log.e(TAG, "Error saving channel key for '$channelName': ${e.message}", e)
@@ -201,36 +166,37 @@ class DataStorageService(private val context: Context) {
         }
     }
 
-    /**
-     * Retrieves a channel-specific AES key, decrypting it using the master key from Android Keystore.
-     */
     suspend fun getChannelKey(channelName: String): SecretKey? {
+        if (channelKeyCache.containsKey(channelName)) {
+            Log.d(TAG, "Returning cached channel key for '$channelName'.")
+            return channelKeyCache[channelName]
+        }
         val alias = CHANNEL_PASSWORD_KEY_ALIAS_PREFIX + channelName.hashCode().toString()
+        Log.d(TAG, "Attempting to retrieve and decrypt channel key for '$channelName' using Keystore alias '$alias'.")
         try {
-            val preferences = context.dataStore.data.firstOrNull() ?: return null
-            val encryptedKeyB64 = preferences[stringPreferencesKey("enc_channel_key_$channelName")] ?: return null
-            val ivB64 = preferences[stringPreferencesKey("enc_channel_iv_$channelName")] ?: return null
+            val preferences = context.dataStore.data.firstOrNull() ?: run { Log.w(TAG, "DataStore preferences not found for channel '$channelName'."); return null }
+            val encryptedKeyB64 = preferences[stringPreferencesKey("enc_channel_key_b64_$channelName")] ?: run { Log.w(TAG, "Encrypted channel key not found in DataStore for '$channelName'."); return null }
+            val ivB64 = preferences[stringPreferencesKey("enc_channel_iv_b64_$channelName")] ?: run { Log.w(TAG, "IV for channel key not found in DataStore for '$channelName'."); return null }
 
-            val encryptedKey = android.util.Base64.decode(encryptedKeyB64, android.util.Base64.NO_WRAP)
-            val iv = android.util.Base64.decode(ivB64, android.util.Base64.NO_WRAP)
+            val encryptedKey = Base64.decode(encryptedKeyB64, Base64.NO_WRAP)
+            val iv = Base64.decode(ivB64, Base64.NO_WRAP)
 
-            val keyStore = KeyStore.getInstance(ANDROID_KEYSTORE_PROVIDER)
-            keyStore.load(null)
-
+            val keyStore = KeyStore.getInstance(ANDROID_KEYSTORE_PROVIDER).apply { load(null) }
             if (!keyStore.containsAlias(alias)) {
-                Log.w(TAG, "Keystore key for channel '$channelName' not found.")
+                Log.w(TAG, "Keystore wrapping key for channel '$channelName' (alias '$alias') not found.")
                 return null
             }
-            val keystoreKey = keyStore.getKey(alias, null) as SecretKey
+            val keystoreWrappingKey = keyStore.getKey(alias, null) as SecretKey
 
             val cipher = Cipher.getInstance(KEYSTORE_AES_GCM_TRANSFORMATION)
-            val spec = GCMParameterSpec(128, iv) // Tag length 128 bits
-            cipher.init(Cipher.DECRYPT_MODE, keystoreKey, spec)
+            val spec = GCMParameterSpec(EncryptionService.GCM_TAG_LENGTH_BYTES * 8, iv)
+            cipher.init(Cipher.DECRYPT_MODE, keystoreWrappingKey, spec)
 
             val decryptedKeyBytes = cipher.doFinal(encryptedKey)
-            Log.d(TAG, "Channel key for '$channelName' retrieved and decrypted.")
-            return SecretKeySpec(decryptedKeyBytes, "AES")
-
+            val finalKey = SecretKeySpec(decryptedKeyBytes, "AES")
+            Log.i(TAG, "Channel key for '$channelName' (decrypted size ${finalKey.encoded.size}B) retrieved and decrypted successfully.")
+            channelKeyCache[channelName] = finalKey
+            return finalKey
         } catch (e: Exception) {
             Log.e(TAG, "Error retrieving or decrypting channel key for '$channelName': ${e.message}", e)
             return null
@@ -239,132 +205,160 @@ class DataStorageService(private val context: Context) {
 
     suspend fun deleteChannelKey(channelName: String) {
         val alias = CHANNEL_PASSWORD_KEY_ALIAS_PREFIX + channelName.hashCode().toString()
+        Log.d(TAG, "Deleting channel key and Keystore entry for '$channelName' (alias '$alias').")
         try {
-            val keyStore = KeyStore.getInstance(ANDROID_KEYSTORE_PROVIDER)
-            keyStore.load(null)
+            val keyStore = KeyStore.getInstance(ANDROID_KEYSTORE_PROVIDER).apply { load(null) }
             if (keyStore.containsAlias(alias)) {
                 keyStore.deleteEntry(alias)
+                Log.i(TAG, "Keystore entry for alias '$alias' deleted.")
             }
             context.dataStore.dsEdit { settings ->
-                settings.remove(stringPreferencesKey("enc_channel_key_$channelName"))
-                settings.remove(stringPreferencesKey("enc_channel_iv_$channelName"))
+                settings.remove(stringPreferencesKey("enc_channel_key_b64_$channelName"))
+                settings.remove(stringPreferencesKey("enc_channel_iv_b64_$channelName"))
             }
-            Log.d(TAG, "Channel key and Keystore entry for '$channelName' deleted.")
+            channelKeyCache.remove(channelName)
+            Log.i(TAG, "Channel key data for '$channelName' deleted from DataStore and cache.")
         } catch (e: Exception) {
             Log.e(TAG, "Error deleting channel key for '$channelName': ${e.message}", e)
         }
     }
 
-    // --- Message Persistence (Using DataStore with JSON serialization for List<UiMessage>) ---
-    // Helper to get DataStore key for a channel's message list
-    private fun dsKeyMessagesForChannel(channelName: String) = stringPreferencesKey("messages_${channelName.replace("#", "")}")
+    // --- Message Persistence ---
+    private fun dsKeyMessagesForChannel(channelName: String) = stringPreferencesKey("messages_json_${channelName.replace("#", "")}_v2")
 
-    // For JSON Serialization of UiMessage list
-    // Add dependency: implementation("com.google.code.gson:gson:2.10.1") or kotlinx.serialization
-    // Using Gson for simplicity here.
-    private val gson = com.google.gson.Gson()
-    private val uiMessageListTypeToken = object : com.google.gson.reflect.TypeToken<List<UiMessage>>() {}.type
-
-
-    /**
-     * Adds a new message to the list of messages for a given channel in DataStore.
-     * @param channelName The channel to add the message to.
-     * @param message The UiMessage to add.
-     */
     suspend fun addMessageToChannel(channelName: String, message: UiMessage) {
+        Log.d(TAG, "Adding message ID ${message.id} to channel '$channelName'.")
         context.dataStore.dsEdit { settings ->
             val currentMessagesJson = settings[dsKeyMessagesForChannel(channelName)]
             val currentMessages: MutableList<UiMessage> = if (currentMessagesJson != null) {
                 try {
                     gson.fromJson(currentMessagesJson, uiMessageListTypeToken)
                 } catch (e: Exception) {
-                    Log.e(TAG, "Error parsing existing messages for channel $channelName, starting fresh.", e)
+                    Log.e(TAG, "Error parsing existing messages for channel '$channelName', starting fresh list.", e)
                     mutableListOf()
                 }
             } else {
                 mutableListOf()
             }
             currentMessages.add(message)
-            // Optional: Limit the number of stored messages per channel
-            // while (currentMessages.size > MAX_MESSAGES_PER_CHANNEL) { currentMessages.removeFirstOrNull() }
             settings[dsKeyMessagesForChannel(channelName)] = gson.toJson(currentMessages)
-            Log.d(TAG, "Message ${message.id} added to channel $channelName in DataStore.")
+            Log.i(TAG, "Message ID ${message.id} added to DataStore for channel '$channelName'. Total messages: ${currentMessages.size}")
         }
     }
 
-    /**
-     * Retrieves all messages for a specific channel from DataStore as a Flow.
-     * @param channelName The channel whose messages are to be retrieved.
-     * @return A Flow emitting a list of UiMessages.
-     */
     fun getMessagesForChannel(channelName: String): Flow<List<UiMessage>> {
+        Log.d(TAG, "Getting messages flow for channel '$channelName'.")
         return context.dataStore.data
+            .catch { exception ->
+                Log.e(TAG, "Error reading messages DataStore for channel '$channelName'.", exception)
+                if (exception is IOException) emit(emptyPreferences()) else throw exception
+            }
             .map { preferences ->
                 val messagesJson = preferences[dsKeyMessagesForChannel(channelName)]
                 if (messagesJson != null) {
                     try {
-                        gson.fromJson<List<UiMessage>>(messagesJson, uiMessageListTypeToken) ?: emptyList()
+                        val msgs = gson.fromJson<List<UiMessage>>(messagesJson, uiMessageListTypeToken) ?: emptyList()
+                        Log.d(TAG, "Loaded ${msgs.size} messages from JSON for channel '$channelName'.")
+                        msgs
                     } catch (e: Exception) {
-                        Log.e(TAG, "Error parsing messages for channel $channelName from DataStore.", e)
+                        Log.e(TAG, "Error parsing messages JSON for channel '$channelName'.", e)
                         emptyList()
                     }
                 } else {
+                    Log.d(TAG, "No messages JSON found for channel '$channelName'. Returning empty list.")
                     emptyList()
                 }
             }
-            .catch { exception ->
-                Log.e(TAG, "Error reading messages flow for channel $channelName from DataStore.", exception)
-                emit(emptyList()) // Emit empty list in case of error reading the flow
-            }
     }
 
-    /**
-     * Clears all messages for a specific channel from DataStore.
-     * @param channelName The channel whose messages are to be cleared.
-     */
     suspend fun clearMessagesForChannel(channelName: String) {
+        Log.i(TAG, "Clearing messages for channel '$channelName'.")
         context.dataStore.dsEdit { settings ->
             settings.remove(dsKeyMessagesForChannel(channelName))
-            Log.i(TAG, "Messages for channel $channelName cleared from DataStore.")
         }
     }
 
-    /**
-     * Clears all message history from all channels.
-     * This is a destructive operation.
-     */
     suspend fun clearAllMessages() {
+        Log.w(TAG, "Clearing ALL messages from ALL channels. This is a destructive operation.")
         context.dataStore.dsEdit { settings ->
-            // Find all keys related to messages and remove them. This is a bit tricky with dynamic keys.
-            // A simpler approach for full clear is to just clear all preferences if this datastore is ONLY for messages.
-            // Or, if you have a known list of channels, iterate and remove.
-            // For a truly dynamic scenario without knowing all channel names, this requires listing keys if possible,
-            // or adopting a different strategy (e.g., a single key holding a map of channels to message lists).
-            // The current `preferencesDataStore` doesn't easily support listing all keys.
-            // For now, this will be a placeholder or would require a refactor of how channels are stored.
-            Log.w(TAG, "clearAllMessages() is not fully implemented for dynamically named channel message keys. Consider a different DataStore strategy for this.")
-            // A pragmatic approach if you track active channels elsewhere:
-            // getListOfActiveChannels().forEach { channelName -> settings.remove(dsKeyMessagesForChannel(channelName)) }
-            // For a total wipe of this specific DataStore (if it's ONLY messages and ephemeral data):
-            // settings.clear() // Use with extreme caution, this clears ALL preferences in this DataStore file.
+            val keysToRemove = settings.asMap().keys.filter { it.name.startsWith("messages_json_") }
+            Log.d(TAG, "Found ${keysToRemove.size} message list keys to remove.")
+            for (key in keysToRemove) {
+                settings.remove(key)
+            }
         }
-        Log.i(TAG, "Attempted to clear all messages (implementation may be partial).")
+        Log.i(TAG, "All channel messages cleared from DataStore.")
     }
 
-
-    // --- SharedPreferences (Legacy Example - can be removed if fully migrating to DataStore) ---
-    @Deprecated("Use DataStore (displayNameFlow and saveDisplayName) instead.", ReplaceWith("saveDisplayName(displayName)"))
-    fun saveDisplayNameSharedPrefs(displayName: String) {
-        val sharedPrefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        sharedPrefs.edit {
-            putString(KEY_DISPLAY_NAME, displayName)
+    // --- Peer Public Key Management ---
+    suspend fun preloadPeerPublicKeysCache() {
+        if (peerPublicKeysCache.isEmpty()) {
+            Log.i(TAG, "Preloading peer public keys into cache.")
+            val allKeys = loadPeerPublicKeysFromDataStore()
+            allKeys.forEach { (id, key) -> peerPublicKeysCache[id] = key }
+            Log.i(TAG, "Preloaded ${peerPublicKeysCache.size} peer public keys into cache.")
+        } else {
+            Log.d(TAG, "Peer public key cache already populated (${peerPublicKeysCache.size} keys). No preload needed.")
         }
-        Log.d(TAG, "Display name saved to SharedPreferences.")
     }
 
-    @Deprecated("Use DataStore instead for display name")
-    fun getDisplayNameSharedPrefs(): String? {
-        val sharedPrefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        return sharedPrefs.getString(KEY_DISPLAY_NAME, null)
+    private suspend fun loadPeerPublicKeysFromDataStore(): Map<String, ByteArray> {
+        Log.d(TAG, "Loading all peer public keys from DataStore (Key: ${PEER_PUBLIC_KEYS_DS_KEY.name}).")
+        val jsonString = context.dataStore.data
+            .map { preferences -> preferences[PEER_PUBLIC_KEYS_DS_KEY] ?: "{}" }
+            .firstOrNull() ?: "{}"
+        return try {
+            val base64Map: Map<String, String> = gson.fromJson(jsonString, peerPublicKeysMapTypeToken) ?: emptyMap()
+            val loadedKeys = base64Map.mapValues { (peerId, b64Key) ->
+                try { Base64.decode(b64Key, Base64.NO_WRAP) }
+                catch (e: IllegalArgumentException) { Log.e(TAG, "Error decoding Base64 for peer $peerId public key.", e); ByteArray(0) }
+            }.filterValues { it.isNotEmpty() }
+            Log.i(TAG, "Loaded ${loadedKeys.size} peer public keys from DataStore.")
+            loadedKeys
+        } catch (e: Exception) {
+            Log.e(TAG, "Error deserializing peer public keys JSON from DataStore.", e)
+            emptyMap()
+        }
+    }
+
+    private suspend fun savePeerPublicKeysToDataStore(keys: Map<String, ByteArray>) {
+        Log.d(TAG, "Saving ${keys.size} peer public keys to DataStore (Key: ${PEER_PUBLIC_KEYS_DS_KEY.name}).")
+        val base64Map = keys.mapValues { (_, value) -> Base64.encodeToString(value, Base64.NO_WRAP) }
+        val jsonString = gson.toJson(base64Map)
+        context.dataStore.dsEdit { settings -> settings[PEER_PUBLIC_KEYS_DS_KEY] = jsonString }
+        Log.i(TAG, "Successfully saved ${keys.size} peer public keys to DataStore.")
+    }
+
+    suspend fun getPeerPublicKey(peerId: String): ByteArray? {
+        peerPublicKeysCache[peerId]?.let {
+            Log.d(TAG, "Retrieved public key for peer '$peerId' from cache.")
+            return it
+        }
+        Log.d(TAG, "Public key for peer '$peerId' not in cache. Attempting to load from DataStore (will load all if cache was empty).")
+        // Ensure cache is populated if it was empty
+        if (peerPublicKeysCache.isEmpty()) { preloadPeerPublicKeysCache() }
+
+        val keyFromStore = peerPublicKeysCache[peerId] // Try again after potential preload
+        if (keyFromStore != null) {
+             Log.d(TAG, "Retrieved public key for peer '$peerId' from DataStore (via cache refresh).")
+        } else {
+            Log.w(TAG, "Public key for peer '$peerId' not found in cache or DataStore.")
+        }
+        return keyFromStore
+    }
+
+    suspend fun savePeerPublicKey(peerId: String, publicKey: ByteArray) {
+        if (publicKey.isEmpty()) {
+            Log.w(TAG, "Attempted to save an empty public key for peer '$peerId'. Ignoring.")
+            return
+        }
+        val currentKey = peerPublicKeysCache[peerId]
+        if (currentKey != null && currentKey.contentEquals(publicKey)) {
+            Log.d(TAG, "Public key for peer '$peerId' is already up-to-date in cache. No change made to DataStore.")
+            return
+        }
+        Log.i(TAG, "Saving/Updating public key for peer '$peerId' (Size: ${publicKey.size}B). Current cache size: ${peerPublicKeysCache.size}")
+        peerPublicKeysCache[peerId] = publicKey
+        savePeerPublicKeysToDataStore(HashMap(peerPublicKeysCache)) // Save a copy of the cache
     }
 }

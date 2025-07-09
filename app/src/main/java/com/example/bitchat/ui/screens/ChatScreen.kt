@@ -46,10 +46,26 @@ fun ChatScreen(chatViewModel: ChatViewModel = viewModel()) {
     val inputText by chatViewModel.inputText.collectAsState()
     val displayName by chatViewModel.displayName.collectAsState()
     val connectedPeersCount by chatViewModel.connectedPeers.map { it.size }.collectAsState(initial = 0)
+    val isSendingMessage by chatViewModel.isSendingMessage.collectAsState()
+    val errorMessage by chatViewModel.errorMessage.collectAsState()
+    val isBluetoothReady by chatViewModel.isBluetoothReady.collectAsState()
 
-    val context = LocalContext.current // Get current context
-    val lazyListState = rememberLazyListState() // State for controlling and observing the LazyColumn
-    val coroutineScope = rememberCoroutineScope() // Scope for launching coroutines from Composables
+
+    val context = LocalContext.current
+    val lazyListState = rememberLazyListState()
+    val coroutineScope = rememberCoroutineScope()
+    val snackbarHostState = remember { SnackbarHostState() }
+
+    // Effect to show Snackbar when errorMessage changes
+    LaunchedEffect(errorMessage) {
+        errorMessage?.let {
+            snackbarHostState.showSnackbar(
+                message = it,
+                duration = SnackbarDuration.Short
+            )
+            chatViewModel.clearErrorMessage() // Clear error after showing
+        }
+    }
 
     // --- Permissions Handling ---
     // Define required permissions based on Android SDK version.
@@ -100,18 +116,40 @@ fun ChatScreen(chatViewModel: ChatViewModel = viewModel()) {
     }
 
     Scaffold(
+        snackbarHost = { SnackbarHost(snackbarHostState) },
         topBar = {
             TopAppBar(
-                title = { Text("BitChat: $currentChannel ($displayName) - Peers: $connectedPeersCount") },
+                title = {
+                    Column {
+                        Text("BitChat: $currentChannel ($displayName)")
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text("Peers: $connectedPeersCount", style = MaterialTheme.typography.titleSmall)
+                            Spacer(Modifier.width(8.dp))
+                            if (isBluetoothReady) {
+                                Icon(
+                                    Icons.Filled.BluetoothSearching, // Example icon
+                                    contentDescription = "Bluetooth Active",
+                                    tint = MaterialTheme.colorScheme.onPrimaryContainer,
+                                    modifier = Modifier.size(18.dp)
+                                )
+                                Text(" (Active)", style = MaterialTheme.typography.labelMedium)
+                            } else {
+                                Icon(
+                                    Icons.Filled.BluetoothDisabled, // Example icon
+                                    contentDescription = "Bluetooth Inactive",
+                                    tint = MaterialTheme.colorScheme.error,
+                                    modifier = Modifier.size(18.dp)
+                                )
+                                Text(" (Inactive)", style = MaterialTheme.typography.labelMedium)
+                            }
+                        }
+                    }
+                },
                 colors = TopAppBarDefaults.topAppBarColors(
                     containerColor = MaterialTheme.colorScheme.primaryContainer,
-                    titleContentColor = MaterialTheme.colorScheme.onPrimaryContainer
+                    titleContentColor = MaterialTheme.colorScheme.onPrimaryContainer,
                 )
-                // TODO: Implement TopAppBar actions:
-                //  - Settings icon button
-                //  - Peer list icon button
-                //  - Channel list/management icon button
-                //  - Manual Start/Stop Scan/Advertise toggle (for debugging/advanced use)
+                // TODO: Add actions like settings, peer list, etc.
             )
         },
         bottomBar = {
@@ -119,30 +157,31 @@ fun ChatScreen(chatViewModel: ChatViewModel = viewModel()) {
                 text = inputText,
                 onTextChanged = { chatViewModel.onInputTextChanged(it) },
                 onSendClicked = {
-                    if (inputText.isNotBlank()) { // Prevent sending empty messages
+                    if (inputText.isNotBlank()) {
                         chatViewModel.sendMessage(inputText)
                     }
-                }
+                },
+                isSending = isSendingMessage // Pass sending state
             )
-        }
+        },
+        modifier = Modifier.imePadding() // Apply IME padding to the Scaffold itself
     ) { paddingValues ->
         Column(
             modifier = Modifier
                 .fillMaxSize()
-                .padding(paddingValues) // Apply padding from Scaffold (for TopAppBar and BottomBar)
-                .padding(horizontal = 8.dp) // Overall horizontal padding for the content area
+                .padding(paddingValues) // Apply padding from Scaffold
+                .padding(horizontal = 8.dp)
         ) {
-            // If not all permissions are granted, display the permission request UI.
             if (!permissionsState.allPermissionsGranted) {
                 PermissionRequestUI(permissionsState = permissionsState)
             } else {
-                 // Message List Area
                 LazyColumn(
                     state = lazyListState,
-                    modifier = Modifier.weight(1f), // Makes the LazyColumn take up available vertical space
-                    verticalArrangement = Arrangement.spacedBy(8.dp) // Adds space between message items
+                    modifier = Modifier.weight(1f),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                    contentPadding = PaddingValues(vertical = 8.dp) // Padding for the list itself
                 ) {
-                    items(messages, key = { it.id }) { message -> // Use message ID as a stable key
+                    items(messages, key = { it.id }) { message ->
                         MessageItem(message = message)
                     }
                 }
@@ -283,19 +322,27 @@ fun MessageInputRow(
                 onValueChange = onTextChanged,
                 modifier = Modifier.weight(1f), // TextField takes available horizontal space
                 placeholder = { Text("Type a message or /command") },
-                singleLine = true, // For a single-line input field
-                // TODO: Consider using `KeyboardOptions` and `KeyboardActions` for 'Send' IME action
-                // keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
-                // keyboardActions = KeyboardActions(onSend = { if (text.isNotBlank()) onSendClicked() }),
-                textStyle = MaterialTheme.typography.bodyLarge // Consistent text style
+                placeholder = { Text("Type a message or /command") },
+                textStyle = MaterialTheme.typography.bodyLarge,
+                maxLines = 5, // Allow multiline input up to 5 lines
+                // keyboardOptions = KeyboardOptions.Default.copy(imeAction = ImeAction.Send), // Optional: for send button on keyboard
+                // keyboardActions = KeyboardActions(onSend = { if (text.isNotBlank() && !isSending) onSendClicked() })
             )
-            Spacer(modifier = Modifier.width(8.dp)) // Space between TextField and Button
+            Spacer(modifier = Modifier.width(8.dp))
             Button(
                 onClick = onSendClicked,
-                enabled = text.isNotBlank(), // Enable button only if there is text to send
-                modifier = Modifier.height(IntrinsicSize.Min) // Attempt to match TextField height (may need adjustment)
+                enabled = text.isNotBlank() && !isSending, // Disable if text is blank or already sending
+                modifier = Modifier.height(IntrinsicSize.Min)
             ) {
-                Text("SEND")
+                if (isSending) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(24.dp),
+                        color = MaterialTheme.colorScheme.onPrimary,
+                        strokeWidth = 2.dp
+                    )
+                } else {
+                    Icon(Icons.Filled.Send, contentDescription = "Send Message")
+                }
             }
         }
     }
@@ -310,59 +357,46 @@ fun MessageInputRow(
 @Preview(showBackground = true, name = "Chat Screen - Light Mode")
 @Composable
 fun ChatScreenPreviewLight() {
-    val previewViewModel = ChatViewModel(Application())
-    LaunchedEffect(Unit) {
-        try {
-            // Using reflection to set mock messages for preview. This is a common workaround.
-            // Not for production code.
-            val messagesField = ChatViewModel::class.java.getDeclaredField("_messages")
-            messagesField.isAccessible = true
-            @Suppress("UNCHECKED_CAST")
-            val messagesFlow = messagesField.get(previewViewModel) as MutableStateFlow<List<UiMessage>>
-            messagesFlow.value = listOf(
-                UiMessage(senderName = "Alice", text = "Hello Bob! This is a longer message to test how it wraps within the bubble and fits the screen.", isFromCurrentUser = false, channel = "#general", timestamp = System.currentTimeMillis() - 200000),
-                UiMessage(senderName = "Bob (Me)", text = "Hi Alice! How are you doing today? I'm testing my message bubble.", isFromCurrentUser = true, channel = "#general", timestamp = System.currentTimeMillis() - 100000),
-                UiMessage(senderName = "Alice", text = "I'm good, thanks! Just testing this new chat app. It looks pretty cool!", isFromCurrentUser = false, channel = "#general", timestamp = System.currentTimeMillis() - 50000),
-                UiMessage(senderName = "System", text = "User 'Charlie' joined #general.", isFromCurrentUser = false, channel = "#general", timestamp = System.currentTimeMillis() - 40000)
-            )
-        } catch (e: Exception) {
-            Log.e("ChatScreenPreview", "Error setting mock messages for light preview: ${e.message}")
-        }
-    }
-
-    com.example.bitchat.ui.theme.BitChatTheme(darkTheme = false) { // Explicitly set light theme
-        ChatScreen(chatViewModel = previewViewModel)
+    // Simplified preview setup due to complexities with AndroidViewModel and context
+    // For more complex previews, consider a FakeChatViewModel or passing mock data directly.
+    com.example.bitchat.ui.theme.BitChatTheme(darkTheme = false) {
+        // Provide a ChatViewModel instance appropriate for previews.
+        // This might require a factory or a way to mock dependencies if ChatViewModel needs them.
+        // For simplicity, if viewModel() works in preview, use it, otherwise manual instantiation with mocks.
+        ChatScreen(chatViewModel = viewModel(factory = object : androidx.lifecycle.ViewModelProvider.Factory {
+            override fun <T : androidx.lifecycle.ViewModel> create(modelClass: Class<T>): T {
+                if (modelClass.isAssignableFrom(ChatViewModel::class.java)) {
+                    @Suppress("UNCHECKED_CAST")
+                    return ChatViewModel(LocalContext.current.applicationContext as Application) as T
+                }
+                throw IllegalArgumentException("Unknown ViewModel class for preview")
+            }
+        }))
     }
 }
 
 /**
  * Preview for the ChatScreen in Dark Mode.
  */
+// Preview for Dark Mode (similar setup)
 @Preview(showBackground = true, name = "Chat Screen - Dark Mode")
 @Composable
 fun ChatScreenPreviewDark() {
-     val previewViewModel = ChatViewModel(Application())
-    LaunchedEffect(Unit) {
-        try {
-            val messagesField = ChatViewModel::class.java.getDeclaredField("_messages")
-            messagesField.isAccessible = true
-            @Suppress("UNCHECKED_CAST")
-            val messagesFlow = messagesField.get(previewViewModel) as MutableStateFlow<List<UiMessage>>
-            messagesFlow.value = listOf(
-                UiMessage(senderName = "Alice", text = "Dark mode test message!", isFromCurrentUser = false, channel = "#darktheme", timestamp = System.currentTimeMillis() - 10000),
-                UiMessage(senderName = "Bob (Me)", text = "This looks good in dark mode too!", isFromCurrentUser = true, channel = "#darktheme", timestamp = System.currentTimeMillis())
-            )
-        } catch (e: Exception) {
-            Log.e("ChatScreenPreview", "Error setting mock messages for dark preview: ${e.message}")
-        }
-    }
-    com.example.bitchat.ui.theme.BitChatTheme(darkTheme = true) { // Explicitly set dark theme
-        ChatScreen(chatViewModel = previewViewModel)
+    com.example.bitchat.ui.theme.BitChatTheme(darkTheme = true) {
+        ChatScreen(chatViewModel = viewModel(factory = object : androidx.lifecycle.ViewModelProvider.Factory {
+            override fun <T : androidx.lifecycle.ViewModel> create(modelClass: Class<T>): T {
+                if (modelClass.isAssignableFrom(ChatViewModel::class.java)) {
+                    @Suppress("UNCHECKED_CAST")
+                    return ChatViewModel(LocalContext.current.applicationContext as Application) as T
+                }
+                throw IllegalArgumentException("Unknown ViewModel class for preview")
+            }
+        }))
     }
 }
 
-// Helper function for reflection, typically used in previews for accessing private fields.
-// Not recommended for production code due to its brittleness and violation of encapsulation.
-// fun Any.GetType(): Class<*> = this::class.java // Already present in original, kept if needed elsewhere.
-// Note: The GetType() helper was removed as it's not directly used in these refined previews.
-// The reflection for _messages is done directly within the LaunchedEffect.
+// Icons used
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.BluetoothDisabled
+import androidx.compose.material.icons.filled.BluetoothSearching
+import androidx.compose.material.icons.filled.Send

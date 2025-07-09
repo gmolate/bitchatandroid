@@ -1,538 +1,481 @@
 package com.example.bitchat.models
 
-import android.util.Log // For logging within BinaryProtocol
+import android.util.Log
 import com.example.bitchat.services.EncryptionService // Needed for context in serialization
-// TODO: Import actual LZ4Util and PKCS7Util once implemented
-// import com.example.bitchat.utils.CompressionUtil
-// import com.example.bitchat.utils.PKCS7Util
+import com.example.bitchat.utils.CompressionUtil // Use actual CompressionUtil
+import com.example.bitchat.utils.PaddingUtil     // Use actual PaddingUtil
+import java.io.ByteArrayInputStream
+import java.io.ByteArrayOutputStream
+import java.io.DataInputStream
+import java.io.DataOutputStream
+import java.io.IOException
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.UUID
-
-// --- Core Data Structures ---
-
-// Placeholder for actual utility classes that would be in com.example.bitchat.utils
-object LZ4Util {
-    fun compress(data: ByteArray): ByteArray { Log.d("LZ4Util", "Placeholder compress called"); return data }
-    fun decompress(data: ByteArray, originalLength: Int): ByteArray { Log.d("LZ4Util", "Placeholder decompress called"); return data }
-}
-object PKCS7Util {
-    fun pad(data: ByteArray, blockSize: Int): ByteArray { Log.d("PKCS7Util", "Placeholder pad called"); return data }
-    fun unpad(data: ByteArray): ByteArray? { Log.d("PKCS7Util", "Placeholder unpad called"); return data }
-}
-// object LZ4Util {
-//     fun compress(data: ByteArray): ByteArray { /* TODO */ return data }
-//     fun decompress(data: ByteArray): ByteArray { /* TODO */ return data }
-// }
-// object PKCS7Util {
-//     fun pad(data: ByteArray, blockSize: Int): ByteArray { /* TODO */ return data }
-//     fun unpad(data: ByteArray): ByteArray? { /* TODO */ return data }
-// }
+import javax.crypto.SecretKey // For sharedSecretKey type hint
+import javax.crypto.spec.SecretKeySpec
 
 
 /**
  * Represents the overall packet structure in the BitChat protocol.
- *
- * Mimics the Swift BitchatPacket structure:
- * struct BitchatPacket: Codable {
- *     let id: UUID          // Unique packet identifier
- *     let sourceId: String  // Ephemeral ID of the sender
- *     let message: BitchatMessage // The actual message content
- *     let timestamp: Date   // Timestamp of when the packet was created
- *     let ttl: Int          // Time-to-live for store-and-forward
- *     var hops: Int = 0     // Number of hops this packet has taken
- *     var rssiAtLastHop: Int? // Optional RSSI at the last hop for metrics
- *     var signature: Data?  // Optional Ed25519 signature of (id, sourceId, message, timestamp, ttl, hops)
- * }
  */
 data class BitchatPacket(
     val id: UUID = UUID.randomUUID(),
     val sourceId: String, // Ephemeral Peer ID (String in iOS, likely a UUID string)
-    val message: BitchatMessage,
-    val timestamp: Long = System.currentTimeMillis(), // Using Long for timestamp (Date in Swift)
+    val message: BitchatMessage, // The deserialized BitchatMessage object
+    val timestamp: Long = System.currentTimeMillis(),
     val ttl: Int,
     var hops: Int = 0,
     var rssiAtLastHop: Int? = null,
-    var signature: ByteArray? = null // Ed25519 signature
+    var signature: ByteArray? = null, // Ed25519 signature
+    @Transient var messagePayloadBytes: ByteArray? = null // Holds the raw serialized BitchatMessage bytes. Crucial for signing/verification.
 ) {
-    // Data to be signed: (id, sourceId, message bytes, timestamp, ttl, hops)
-    fun dataToSign(messageBytes: ByteArray): ByteArray {
-        val buffer = ByteBuffer.allocate(16 + 4 + sourceId.toByteArray(Charsets.UTF_8).size + 4 + messageBytes.size + 8 + 4 + 4)
-            .order(ByteOrder.BIG_ENDIAN) // Consistent with typical network order
+    /**
+     * Generates the byte array that should be signed.
+     * Uses `messagePayloadBytes`. This field MUST be set before calling this method.
+     * Content: id, sourceId, messagePayloadBytes, timestamp, ttl, hops
+     */
+    fun dataToSign(): ByteArray {
+        val payloadToSign = this.messagePayloadBytes
+            ?: throw IllegalStateException("messagePayloadBytes is null. It must be set before calling dataToSign for packet ID: $id. Message type: ${message::class.simpleName}")
+
+        val sourceIdBytes = sourceId.toByteArray(Charsets.UTF_8)
+        // UUID (16) + sourceId_len (4) + sourceId_bytes + payload_len (4) + payload_bytes + timestamp (8) + ttl (4) + hops (4)
+        val requiredBufferSize = 16 + 4 + sourceIdBytes.size + 4 + payloadToSign.size + 8 + 4 + 4
+
+        val buffer = ByteBuffer.allocate(requiredBufferSize).order(ByteOrder.BIG_ENDIAN)
 
         buffer.putLong(id.mostSignificantBits)
         buffer.putLong(id.leastSignificantBits)
 
-        val sourceIdBytes = sourceId.toByteArray(Charsets.UTF_8)
         buffer.putInt(sourceIdBytes.size)
         buffer.put(sourceIdBytes)
 
-        buffer.putInt(messageBytes.size)
-        buffer.put(messageBytes)
+        buffer.putInt(payloadToSign.size)
+        buffer.put(payloadToSign)
 
         buffer.putLong(timestamp)
         buffer.putInt(ttl)
         buffer.putInt(hops)
-        // rssiAtLastHop is not part of the signature in the iOS version from what I remember.
         return buffer.array()
     }
+
+    override fun equals(other: Any?): Boolean {
+        if (this === other) return true
+        if (javaClass != other?.javaClass) return false
+        other as BitchatPacket
+        return id == other.id
+    }
+
+    override fun hashCode(): Int = id.hashCode()
 }
 
 /**
  * Represents the core message content within a BitchatPacket.
- *
- * Mimics the Swift BitchatMessage structure:
- * enum BitchatMessage: Codable {
- *     case announce(peerId: String, displayName: String, publicKey: Data)
- *     case keyExchangeRequest(peerId: String, ephemeralPublicKey: Data)
- *     case keyExchangeResponse(peerId: String, ephemeralPublicKey: Data)
- *     case userMessage(channel: String, senderDisplayName: String, text: String, isPrivate: Bool, isCompressed: Bool)
- *     case fragment(originalMessageId: UUID, fragmentIndex: Int, totalFragments: Int, data: Data)
- *     case ack(messageId: UUID)
- *     case channelJoinRequest(channel: String, passwordHash: Data?) // passwordHash is PBKDF2 derived
- *     case channelJoinResponse(channel: String, success: Bool, error: String?)
- *     case channelCreateRequest(channel: String, passwordHash: Data?)
- *     case channelCreateResponse(channel: String, success: Bool, error: String?)
- *     // ... other message types like error, ping, pong if defined
- * }
  */
 sealed class BitchatMessage {
     abstract val typeByte: Byte
 
     data class Announce(
-        val peerId: String, // Ephemeral Peer ID
+        val peerId: String,
         val displayName: String,
-        val publicKey: ByteArray // Ed25519 Public Key
-    ) : BitchatMessage() {
-        override val typeByte: Byte = 0x01
-        // TODO: equals/hashCode for ByteArray
-    }
+        val publicKey: ByteArray
+    ) : BitchatMessage() { override val typeByte: Byte = 0x01 }
 
     data class KeyExchangeRequest(
-        val peerId: String, // Ephemeral Peer ID of requester
-        val ephemeralPublicKey: ByteArray // X25519 Ephemeral Public Key
-    ) : BitchatMessage() {
-        override val typeByte: Byte = 0x02
-        // TODO: equals/hashCode for ByteArray
-    }
+        val peerId: String,
+        val ephemeralPublicKey: ByteArray
+    ) : BitchatMessage() { override val typeByte: Byte = 0x02 }
 
     data class KeyExchangeResponse(
-        val peerId: String, // Ephemeral Peer ID of responder
-        val ephemeralPublicKey: ByteArray // X25519 Ephemeral Public Key
-    ) : BitchatMessage() {
-        override val typeByte: Byte = 0x03
-        // TODO: equals/hashCode for ByteArray
-    }
+        val peerId: String,
+        val ephemeralPublicKey: ByteArray
+    ) : BitchatMessage() { override val typeByte: Byte = 0x03 }
 
     data class UserMessage(
         val channel: String,
         val senderDisplayName: String,
         val text: String,
         val isPrivate: Boolean,
-        var isCompressed: Boolean // This might be set by BinaryProtocol during serialization
-    ) : BitchatMessage() {
-        override val typeByte: Byte = 0x04
-    }
+        var isCompressed: Boolean
+    ) : BitchatMessage() { override val typeByte: Byte = 0x04 }
 
     data class Fragment(
         val originalMessageId: UUID,
         val fragmentIndex: Int,
         val totalFragments: Int,
         val data: ByteArray
-    ) : BitchatMessage() {
-        override val typeByte: Byte = 0x05
-        // TODO: equals/hashCode for ByteArray
-    }
+    ) : BitchatMessage() { override val typeByte: Byte = 0x05 }
 
     data class Ack(
         val messageId: UUID
-    ) : BitchatMessage() {
-        override val typeByte: Byte = 0x06
-    }
+    ) : BitchatMessage() { override val typeByte: Byte = 0x06 }
 
     data class ChannelJoinRequest(
         val channel: String,
-        val passwordHash: ByteArray? = null // PBKDF2 derived hash
-    ) : BitchatMessage() {
-        override val typeByte: Byte = 0x07
-        // TODO: equals/hashCode for ByteArray
-    }
+        val passwordHash: ByteArray? = null
+    ) : BitchatMessage() { override val typeByte: Byte = 0x07 }
 
     data class ChannelJoinResponse(
         val channel: String,
         val success: Boolean,
         val error: String? = null
-    ) : BitchatMessage() {
-        override val typeByte: Byte = 0x08
-    }
+    ) : BitchatMessage() { override val typeByte: Byte = 0x08 }
 
     data class ChannelCreateRequest(
         val channel: String,
         val passwordHash: ByteArray? = null
-    ) : BitchatMessage() {
-        override val typeByte: Byte = 0x09
-        // TODO: equals/hashCode for ByteArray
-    }
+    ) : BitchatMessage() { override val typeByte: Byte = 0x09 }
 
     data class ChannelCreateResponse(
         val channel: String,
         val success: Boolean,
         val error: String? = null
-    ) : BitchatMessage() {
-        override val typeByte: Byte = 0x0A
-    }
-
-    // Add other message types here if they exist in the iOS protocol
-    // e.g., ErrorMessage, Ping, Pong
+    ) : BitchatMessage() { override val typeByte: Byte = 0x0A }
 }
 
 
-// --- Binary Protocol for Serialization/Deserialization ---
-// This could be a separate BinaryProtocol.kt file
 object BinaryProtocol {
-    private const val TAG = "BinaryProtocol"
-    private const val LZ4_COMPRESSION_THRESHOLD = 100 // Bytes, example value
-    private const val AES_BLOCK_SIZE = 16 // Bytes, for PKCS7 padding with AES
+    private const val TAG = "BitChatProtocol"
+    private const val LZ4_COMPRESSION_THRESHOLD_BYTES = 100
+    private const val AES_BLOCK_SIZE_BYTES = 16
+    private const val AES_KEY_SIZE_BITS = 256
+    private const val GCM_IV_LENGTH_BYTES = 12
+    private const val PACKET_VERSION_1: Byte = 0x01
 
-    // --- Serialization ---
 
-    fun serializePacket(packet: BitchatPacket, encryptionService: EncryptionService, sharedSecret: ByteArray? = null): ByteArray? {
+    fun serializePacket(packet: BitchatPacket, encryptionService: EncryptionService, sharedSecretKey: SecretKey? = null): ByteArray? {
         try {
-            var messagePayload = serializeMessage(packet.message, encryptionService, sharedSecret) ?: return null
+            // Ensure messagePayloadBytes is set in the packet
+            if (packet.messagePayloadBytes == null) {
+                Log.d(TAG, "serializePacket: messagePayloadBytes not pre-set for packet ${packet.id}, serializing BitchatMessage now.")
+                packet.messagePayloadBytes = serializeMessage(packet.message, encryptionService, sharedSecretKey)
+            }
+            val messagePayloadToEmbed = packet.messagePayloadBytes
+                ?: run {
+                    Log.e(TAG, "serializePacket: Failed to obtain/serialize message payload for packet ${packet.id}. Message type: ${packet.message::class.simpleName}")
+                    return null
+                }
 
-            // Sign the packet *before* any further processing of the message payload for fragmentation
-            // The signature covers the original, potentially unfragmented message form.
-            // However, typical BLE MTU limits mean we'll likely send BitchatMessage, not full BitchatPacket as one BLE characteristic write.
-            // The iOS app likely sends BitchatMessage, then the BLE service fragments it.
-            // For now, let's assume the BitchatPacket signature (if present) signs the serialized BitchatMessage.
-            // This needs to be verified against the iOS app's exact behavior.
-            // If the packet.signature is for the *entire* BitchatPacket (excluding signature itself),
-            // then this signing step should happen last on the fully assembled packet.
-            // Let's assume for now signature is on (id, sourceId, messageBytes, timestamp, ttl, hops)
-
-            val dataToSign = packet.dataToSign(messagePayload)
-            // packet.signature = encryptionService.signEd25519(dataToSign, /* sender's Ed25519 private key */)
-            // The private key for signing needs to be available. This is usually the device's identity key.
-            // This part needs careful integration with key management.
-
-            // The following is a conceptual serialization of the BitchatPacket structure.
-            // In practice, for BLE, you'd likely serialize BitchatMessage and handle fragmentation at a lower layer.
-            // This serialization is more for if the entire packet were to be sent as one unit.
-
-            val buffer = ByteBuffer.allocate(1024 * 10) // Generous buffer, calculate more precisely
-                .order(ByteOrder.BIG_ENDIAN)
-
-            // Packet ID (UUID)
-            buffer.putLong(packet.id.mostSignificantBits)
-            buffer.putLong(packet.id.leastSignificantBits)
-
-            // Source ID (String)
-            val sourceIdBytes = packet.sourceId.toByteArray(Charsets.UTF_8)
-            buffer.putInt(sourceIdBytes.size)
-            buffer.put(sourceIdBytes)
-
-            // Message (byte array from serializeMessage)
-            buffer.putInt(messagePayload.size)
-            buffer.put(messagePayload)
-
-            // Timestamp (Long)
-            buffer.putLong(packet.timestamp)
-            // TTL (Int)
-            buffer.putInt(packet.ttl)
-            // Hops (Int)
-            buffer.putInt(packet.hops)
-
-            // RSSI At Last Hop (Optional Int)
-            buffer.put(if (packet.rssiAtLastHop != null) 1.toByte() else 0.toByte())
-            packet.rssiAtLastHop?.let { buffer.putInt(it) }
-
-            // Signature (Optional ByteArray)
-            buffer.put(if (packet.signature != null) 1.toByte() else 0.toByte())
-            packet.signature?.let {
-                buffer.putInt(it.size)
-                buffer.put(it)
+            if (packet.signature == null) {
+                Log.w(TAG, "serializePacket: Packet ${packet.id} (type ${packet.message::class.simpleName}) is being serialized without a signature.")
             }
 
-            val finalPacketBytes = ByteArray(buffer.position())
-            buffer.flip()
-            buffer.get(finalPacketBytes)
+            val baos = ByteArrayOutputStream()
+            val dos = DataOutputStream(baos)
+
+            dos.writeByte(PACKET_VERSION_1.toInt())
+            dos.writeUTF(packet.id.toString())
+            dos.writeUTF(packet.sourceId)
+            dos.writeLong(packet.timestamp)
+            dos.writeInt(packet.ttl)
+            dos.writeInt(packet.hops)
+            dos.writeBoolean(packet.rssiAtLastHop != null)
+            packet.rssiAtLastHop?.let { dos.writeInt(it) }
+            dos.writeBoolean(packet.signature != null)
+            packet.signature?.let {
+                dos.writeInt(it.size)
+                dos.write(it)
+            }
+            dos.writeInt(messagePayloadToEmbed.size)
+            dos.write(messagePayloadToEmbed)
+            dos.flush()
+
+            val finalPacketBytes = baos.toByteArray()
+            Log.i(TAG, "serializePacket: Successfully serialized packet ${packet.id} (${packet.message::class.simpleName}) to ${finalPacketBytes.size} bytes.")
             return finalPacketBytes
 
+        } catch (e: IOException) {
+            Log.e(TAG, "serializePacket: IOException for packet ${packet.id} (${packet.message::class.simpleName}): ${e.message}", e)
+            return null
         } catch (e: Exception) {
-            Log.e(TAG, "Error serializing BitchatPacket: ${e.message}", e)
+            Log.e(TAG, "serializePacket: Unexpected error for packet ${packet.id} (${packet.message::class.simpleName}): ${e.message}", e)
             return null
         }
     }
 
-
-    fun serializeMessage(message: BitchatMessage, encryptionService: EncryptionService, sharedSecret: ByteArray? = null): ByteArray? {
+    fun deserializePacket(data: ByteArray, encryptionService: EncryptionService): BitchatPacket? {
+        // Note: sharedSecretKey for decrypting private messages needs to be determined by the caller (e.g. ChatViewModel)
+        // based on context (e.g. sourceId and key exchange state) and passed to deserializeMessage if needed.
+        // This top-level deserializePacket doesn't have that context.
         try {
-            val payloadBuffer = ByteBuffer.allocate(1024 * 5).order(ByteOrder.BIG_ENDIAN) // Temp buffer for message payload
-            payloadBuffer.put(message.typeByte)
+            val bais = ByteArrayInputStream(data)
+            val dis = DataInputStream(bais)
+
+            val packetVersion = dis.readByte()
+            if (packetVersion != PACKET_VERSION_1) {
+                Log.e(TAG, "deserializePacket: Unsupported packet version: $packetVersion. Expected $PACKET_VERSION_1. Data length: ${data.size}")
+                return null
+            }
+
+            val id = UUID.fromString(dis.readUTF())
+            val sourceId = dis.readUTF()
+            val timestamp = dis.readLong()
+            val ttl = dis.readInt()
+            val hops = dis.readInt()
+            val hasRssi = dis.readBoolean()
+            val rssiAtLastHop = if (hasRssi) dis.readInt() else null
+            val hasSignature = dis.readBoolean()
+            val signature = if (hasSignature) readByteArray(dis) else null
+            val readMessagePayloadBytes = readByteArray(dis)
+
+            // TODO: The caller (e.g. ChatViewModel) needs to determine the correct sharedSecretKey if the message is private.
+            // For now, passing null, which means private messages won't be decrypted here.
+            val sharedSecretKeyForDecryption: SecretKey? = null
+
+            val bitchatMessage = deserializeMessage(readMessagePayloadBytes, encryptionService, sharedSecretKeyForDecryption)
+                ?: run {
+                    Log.e(TAG, "deserializePacket: Failed to deserialize BitchatMessage from packet $id payload (size ${readMessagePayloadBytes.size}).")
+                    return null
+                }
+
+            val packet = BitchatPacket(
+                id = id, sourceId = sourceId, message = bitchatMessage, timestamp = timestamp, ttl = ttl,
+                hops = hops, rssiAtLastHop = rssiAtLastHop, signature = signature,
+                messagePayloadBytes = readMessagePayloadBytes // Store for signature verification
+            )
+            Log.i(TAG, "deserializePacket: Successfully deserialized packet ${packet.id} from ${packet.sourceId}. Type: ${packet.message::class.simpleName}, Payload size: ${packet.messagePayloadBytes?.size}")
+            return packet
+
+        } catch (e: IOException) {
+            Log.e(TAG, "deserializePacket: IOException (Data length: ${data.size}): ${e.message}", e)
+            return null
+        } catch (e: IllegalArgumentException) {
+            Log.e(TAG, "deserializePacket: IllegalArgumentException (e.g. invalid UUID) (Data length: ${data.size}): ${e.message}", e)
+            return null
+        } catch (e: Exception) {
+            Log.e(TAG, "deserializePacket: Unexpected error (Data length: ${data.size}): ${e.message}", e)
+            return null
+        }
+    }
+
+    fun serializeMessage(message: BitchatMessage, encryptionService: EncryptionService, sharedSecretKey: SecretKey? = null): ByteArray? {
+        try {
+            val baos = ByteArrayOutputStream()
+            val dos = DataOutputStream(baos)
+            dos.writeByte(message.typeByte.toInt())
+            Log.d(TAG, "serializeMessage: Starting type ${message::class.simpleName} (0x${message.typeByte.toString(16)})")
 
             when (message) {
                 is BitchatMessage.Announce -> {
-                    putString(payloadBuffer, message.peerId)
-                    putString(payloadBuffer, message.displayName)
-                    putByteArray(payloadBuffer, message.publicKey)
+                    dos.writeUTF(message.peerId)
+                    dos.writeUTF(message.displayName)
+                    writeByteArray(dos, message.publicKey)
                 }
                 is BitchatMessage.KeyExchangeRequest -> {
-                    putString(payloadBuffer, message.peerId)
-                    putByteArray(payloadBuffer, message.ephemeralPublicKey)
+                    dos.writeUTF(message.peerId)
+                    writeByteArray(dos, message.ephemeralPublicKey)
                 }
                 is BitchatMessage.KeyExchangeResponse -> {
-                    putString(payloadBuffer, message.peerId)
-                    putByteArray(payloadBuffer, message.ephemeralPublicKey)
+                    dos.writeUTF(message.peerId)
+                    writeByteArray(dos, message.ephemeralPublicKey)
                 }
                 is BitchatMessage.UserMessage -> {
-                    putString(payloadBuffer, message.channel)
-                    putString(payloadBuffer, message.senderDisplayName)
-
+                    dos.writeUTF(message.channel)
+                    dos.writeUTF(message.senderDisplayName)
                     var textBytes = message.text.toByteArray(Charsets.UTF_8)
-                    var finalPayload = textBytes
+                    var currentPayload = textBytes
+                    var effectiveIsCompressed = false
 
-                    // Compression (if applicable and not private, or if private and compressed before encryption)
-                    // The iOS implementation seems to compress *before* potential encryption for private messages.
-                    var isActuallyCompressed = false
-                    if (message.isCompressed && textBytes.size > LZ4_COMPRESSION_THRESHOLD) {
-                        // val compressed = LZ4Util.compress(textBytes)
-                        // if (compressed.size < textBytes.size) { // Only use if smaller
-                        //    finalPayload = compressed
-                        //    isActuallyCompressed = true
-                        // }
-                        // For now, placeholder:
-                        Log.d(TAG, "Placeholder: Would attempt LZ4 compression for UserMessage")
-                        isActuallyCompressed = message.isCompressed // Assume it worked if requested
+                    if (message.isCompressed && textBytes.size > LZ4_COMPRESSION_THRESHOLD_BYTES) {
+                        Log.d(TAG, "UserMessage: Attempting LZ4 for ${textBytes.size}B for channel '${message.channel}'")
+                        val compressed = CompressionUtil.compress(textBytes)
+                        if (compressed != null && compressed.size < textBytes.size) {
+                            currentPayload = compressed
+                            effectiveIsCompressed = true
+                            Log.i(TAG, "UserMessage: Compressed ${textBytes.size}B -> ${currentPayload.size}B for channel '${message.channel}'.")
+                        } else {
+                             Log.d(TAG, "UserMessage: Compression not effective or failed for channel '${message.channel}'. Original: ${textBytes.size}B, Compressed: ${compressed?.size}B")
+                        }
                     }
 
-                    // Encryption for private messages
                     if (message.isPrivate) {
-                        if (sharedSecret == null) {
-                            Log.e(TAG, "Cannot encrypt private message: shared secret is null.")
+                        if (sharedSecretKey == null) {
+                            Log.e(TAG, "UserMessage: Cannot encrypt private message for channel '${message.channel}'. Shared secret key is NULL.")
                             return null
                         }
-                        // Derive AES key from shared secret (e.g., using HKDF)
-                        // val aesKeyBytes = encryptionService.hkdf(sharedSecret, null, "BitChatAESKey".toByteArray(), AES_KEY_SIZE / 8)
-                        // val aesKey = SecretKeySpec(aesKeyBytes, "AES")
-                        // Log.d(TAG, "Placeholder: Would derive AES key for private UserMessage")
-                        val aesKey = SecretKeySpec(sharedSecret.copyOfRange(0, AES_KEY_SIZE/8), "AES") // Simplified for now
+                        Log.d(TAG, "UserMessage: Encrypting private message (${currentPayload.size}B) for channel '${message.channel}'.")
+                        val paddedPayload = PaddingUtil.addPKCS7Padding(currentPayload, AES_BLOCK_SIZE_BYTES)
+                        Log.d(TAG, "UserMessage: Padded private message for channel '${message.channel}' ${currentPayload.size}B -> ${paddedPayload.size}B.")
 
-                        // PKCS#7 Padding before encryption
-                        // finalPayload = PKCS7Util.pad(finalPayload, AES_BLOCK_SIZE)
-                        Log.d(TAG, "Placeholder: Would PKCS7 pad for private UserMessage")
-
-
-                        // val encryptionResult = encryptionService.encryptAES_GCM(finalPayload, aesKey, null /* AAD if any */)
-                        // if (encryptionResult == null) {
-                        //     Log.e(TAG, "Failed to encrypt private UserMessage")
-                        //     return null
-                        // }
-                        // val iv = encryptionResult.first
-                        // val encryptedDataWithTag = encryptionResult.second
-                        // finalPayload = iv + encryptedDataWithTag // Prepend IV
-                        Log.d(TAG, "Placeholder: Would AES-GCM encrypt private UserMessage")
+                        val encryptionResult = encryptionService.encryptAES_GCM(paddedPayload, sharedSecretKey, null) // AAD could be packet.id or channel name for context
+                        if (encryptionResult == null) {
+                            Log.e(TAG, "UserMessage: Failed to encrypt private message for channel '${message.channel}'.")
+                            return null
+                        }
+                        val (iv, ciphertextWithTag) = encryptionResult
+                        currentPayload = iv + ciphertextWithTag
+                        Log.i(TAG, "UserMessage: Encrypted private message for channel '${message.channel}'. IV:${iv.size}B, Cipher+Tag:${ciphertextWithTag.size}B, Total:${currentPayload.size}B.")
                     }
-
-                    payloadBuffer.put(if (message.isPrivate) 1.toByte() else 0.toByte())
-                    payloadBuffer.put(if (isActuallyCompressed) 1.toByte() else 0.toByte())
-                    putByteArray(payloadBuffer, finalPayload)
+                    dos.writeBoolean(message.isPrivate)
+                    dos.writeBoolean(effectiveIsCompressed) // Store actual compression status
+                    writeByteArray(dos, currentPayload)
                 }
                 is BitchatMessage.Fragment -> {
-                    payloadBuffer.putLong(message.originalMessageId.mostSignificantBits)
-                    payloadBuffer.putLong(message.originalMessageId.leastSignificantBits)
-                    payloadBuffer.putInt(message.fragmentIndex)
-                    payloadBuffer.putInt(message.totalFragments)
-                    putByteArray(payloadBuffer, message.data)
+                    dos.writeUTF(message.originalMessageId.toString())
+                    dos.writeInt(message.fragmentIndex)
+                    dos.writeInt(message.totalFragments)
+                    writeByteArray(dos, message.data)
                 }
-                is BitchatMessage.Ack -> {
-                    payloadBuffer.putLong(message.messageId.mostSignificantBits)
-                    payloadBuffer.putLong(message.messageId.leastSignificantBits)
-                }
+                is BitchatMessage.Ack -> dos.writeUTF(message.messageId.toString())
                 is BitchatMessage.ChannelJoinRequest -> {
-                    putString(payloadBuffer, message.channel)
-                    payloadBuffer.put(if (message.passwordHash != null) 1.toByte() else 0.toByte())
-                    message.passwordHash?.let { putByteArray(payloadBuffer, it) }
+                    dos.writeUTF(message.channel)
+                    dos.writeBoolean(message.passwordHash != null)
+                    message.passwordHash?.let { writeByteArray(dos, it) }
                 }
                 is BitchatMessage.ChannelJoinResponse -> {
-                    putString(payloadBuffer, message.channel)
-                    payloadBuffer.put(if (message.success) 1.toByte() else 0.toByte())
-                    payloadBuffer.put(if (message.error != null) 1.toByte() else 0.toByte())
-                    message.error?.let { putString(payloadBuffer, it) }
+                    dos.writeUTF(message.channel)
+                    dos.writeBoolean(message.success)
+                    dos.writeBoolean(message.error != null)
+                    message.error?.let { dos.writeUTF(it) }
                 }
-                 is BitchatMessage.ChannelCreateRequest -> {
-                    putString(payloadBuffer, message.channel)
-                    payloadBuffer.put(if (message.passwordHash != null) 1.toByte() else 0.toByte())
-                    message.passwordHash?.let { putByteArray(payloadBuffer, it) }
+                is BitchatMessage.ChannelCreateRequest -> {
+                    dos.writeUTF(message.channel)
+                    dos.writeBoolean(message.passwordHash != null)
+                    message.passwordHash?.let { writeByteArray(dos, it) }
                 }
                 is BitchatMessage.ChannelCreateResponse -> {
-                    putString(payloadBuffer, message.channel)
-                    payloadBuffer.put(if (message.success) 1.toByte() else 0.toByte())
-                    payloadBuffer.put(if (message.error != null) 1.toByte() else 0.toByte())
-                    message.error?.let { putString(payloadBuffer, it) }
+                    dos.writeUTF(message.channel)
+                    dos.writeBoolean(message.success)
+                    dos.writeBoolean(message.error != null)
+                    message.error?.let { dos.writeUTF(it) }
                 }
-                // Add other cases
             }
-
-            val resultBytes = ByteArray(payloadBuffer.position())
-            payloadBuffer.flip()
-            payloadBuffer.get(resultBytes)
+            dos.flush()
+            val resultBytes = baos.toByteArray()
+            Log.i(TAG, "serializeMessage: Successfully serialized ${message::class.simpleName} to ${resultBytes.size} bytes.")
             return resultBytes
 
+        } catch (e: IOException) {
+            Log.e(TAG, "serializeMessage: IOException for ${message::class.simpleName}: ${e.message}", e)
+            return null
         } catch (e: Exception) {
-            Log.e(TAG, "Error serializing BitchatMessage: ${e.message}", e)
+            Log.e(TAG, "serializeMessage: Unexpected error for ${message::class.simpleName}: ${e.message}", e)
             return null
         }
     }
 
-    // --- Deserialization ---
-
-    fun deserializePacket(data: ByteArray, encryptionService: EncryptionService, sharedSecret: ByteArray? = null): BitchatPacket? {
-         try {
-            val buffer = ByteBuffer.wrap(data).order(ByteOrder.BIG_ENDIAN)
-
-            val mostSigBits = buffer.long
-            val leastSigBits = buffer.long
-            val packetId = UUID(mostSigBits, leastSigBits)
-
-            val sourceId = getString(buffer)
-
-            val messageLength = buffer.int
-            val messageBytes = ByteArray(messageLength)
-            buffer.get(messageBytes)
-            val bitchatMessage = deserializeMessage(messageBytes, encryptionService, sharedSecret) ?: return null
-
-            val timestamp = buffer.long
-            val ttl = buffer.int
-            val hops = buffer.int
-
-            val hasRssi = buffer.get() == 1.toByte()
-            val rssi = if (hasRssi) buffer.int else null
-
-            val hasSignature = buffer.get() == 1.toByte()
-            val signature = if (hasSignature) getByteArray(buffer) else null
-
-            val packet = BitchatPacket(packetId, sourceId, bitchatMessage, timestamp, ttl, hops, rssi, signature)
-
-            // Verify signature if present
-            // if (signature != null) {
-            //     val expectedDataToSign = packet.dataToSign(messageBytes) // Use the raw messageBytes for verification
-            //     // val senderPublicKey = ... get sender's Ed25519 public key based on sourceId (e.g., from an Announce message)
-            //     // if (!encryptionService.verifyEd25519(expectedDataToSign, signature, senderPublicKey)) {
-            //     //    Log.w(TAG, "Packet signature verification failed for packet ID: $packetId")
-            //     //    return null // Or handle as potentially compromised packet
-            //     // }
-            // }
-            return packet
-
-        } catch (e: Exception) {
-            Log.e(TAG, "Error deserializing BitchatPacket: ${e.message}", e)
-            return null
-        }
-    }
-
-
-    fun deserializeMessage(data: ByteArray, encryptionService: EncryptionService, sharedSecret: ByteArray? = null): BitchatMessage? {
+    fun deserializeMessage(data: ByteArray, encryptionService: EncryptionService, sharedSecretKey: SecretKey? = null): BitchatMessage? {
         try {
-            val buffer = ByteBuffer.wrap(data).order(ByteOrder.BIG_ENDIAN)
-            val typeByte = buffer.get()
+            val bais = ByteArrayInputStream(data)
+            val dis = DataInputStream(bais)
+            if (data.isEmpty()) {
+                Log.e(TAG, "deserializeMessage: Input data is empty.")
+                return null
+            }
+            val typeByte = dis.readByte()
+            Log.d(TAG, "deserializeMessage: Attempting message type 0x${typeByte.toString(16)}")
 
             return when (typeByte) {
-                0x01.toByte() -> BitchatMessage.Announce(getString(buffer), getString(buffer), getByteArray(buffer))
-                0x02.toByte() -> BitchatMessage.KeyExchangeRequest(getString(buffer), getByteArray(buffer))
-                0x03.toByte() -> BitchatMessage.KeyExchangeResponse(getString(buffer), getByteArray(buffer))
+                0x01.toByte() -> BitchatMessage.Announce(dis.readUTF(), dis.readUTF(), readByteArray(dis))
+                0x02.toByte() -> BitchatMessage.KeyExchangeRequest(dis.readUTF(), readByteArray(dis))
+                0x03.toByte() -> BitchatMessage.KeyExchangeResponse(dis.readUTF(), readByteArray(dis))
                 0x04.toByte() -> {
-                    val channel = getString(buffer)
-                    val senderDisplayName = getString(buffer)
-                    val isPrivate = buffer.get() == 1.toByte()
-                    val isCompressed = buffer.get() == 1.toByte()
-                    var payload = getByteArray(buffer)
+                    val channel = dis.readUTF()
+                    val senderDisplayName = dis.readUTF()
+                    val isPrivate = dis.readBoolean()
+                    val isCompressedFlag = dis.readBoolean()
+                    var payload = readByteArray(dis)
+                    Log.d(TAG, "UserMessage: Raw payload ${payload.size}B, isPrivate:$isPrivate, isCompressed:$isCompressedFlag for channel '$channel'")
 
                     if (isPrivate) {
-                        if (sharedSecret == null) {
-                            Log.e(TAG, "Cannot decrypt private message: shared secret is null.")
+                        if (sharedSecretKey == null) {
+                            Log.e(TAG, "UserMessage: Cannot decrypt private message for channel '$channel'. Shared secret key is NULL.")
                             return null
                         }
-                        // val iv = payload.copyOfRange(0, GCM_IV_LENGTH)
-                        // val encryptedDataWithTag = payload.copyOfRange(GCM_IV_LENGTH, payload.size)
-                        // val aesKeyBytes = encryptionService.hkdf(sharedSecret, null, "BitChatAESKey".toByteArray(), AES_KEY_SIZE / 8)
-                        // val aesKey = SecretKeySpec(aesKeyBytes, "AES")
-                        // Log.d(TAG, "Placeholder: Would derive AES key for private UserMessage")
-                        val aesKey = SecretKeySpec(sharedSecret.copyOfRange(0, AES_KEY_SIZE/8), "AES") // Simplified for now
+                        if (payload.size < GCM_IV_LENGTH_BYTES) {
+                            Log.e(TAG, "UserMessage: Private payload for channel '$channel' too short to contain IV. Size: ${payload.size}")
+                            return null
+                        }
+                        val iv = payload.copyOfRange(0, GCM_IV_LENGTH_BYTES)
+                        val ciphertextWithTag = payload.copyOfRange(GCM_IV_LENGTH_BYTES, payload.size)
+                        Log.d(TAG, "UserMessage: Decrypting private message for channel '$channel'. IV:${iv.size}B, Cipher+Tag:${ciphertextWithTag.size}B")
 
-                        // payload = encryptionService.decryptAES_GCM(encryptedDataWithTag, aesKey, iv, null) ?: return null
-                        // payload = PKCS7Util.unpad(payload) ?: return null // Unpad after decryption
-                        Log.d(TAG, "Placeholder: Would AES-GCM decrypt and PKCS7 unpad private UserMessage")
+                        val decryptedPaddedPayload = encryptionService.decryptAES_GCM(ciphertextWithTag, sharedSecretKey, iv, null)
+                        if (decryptedPaddedPayload == null) {
+                            Log.e(TAG, "UserMessage: Failed to decrypt private message for channel '$channel'.")
+                            return null
+                        }
+                        Log.d(TAG, "UserMessage: Decrypted private message for channel '$channel' to ${decryptedPaddedPayload.size}B (padded).")
+                        payload = PaddingUtil.removePKCS7Padding(decryptedPaddedPayload)
+                        if (payload == null) {
+                            Log.e(TAG, "UserMessage: Failed to unpad decrypted private message (PKCS7) for channel '$channel'.")
+                            return null
+                        }
+                         Log.d(TAG, "UserMessage: Unpadded private message for channel '$channel' to ${payload.size}B.")
                     }
 
-                    if (isCompressed) {
-                        // payload = LZ4Util.decompress(payload)
-                        Log.d(TAG, "Placeholder: Would attempt LZ4 decompression for UserMessage")
+                    var actualText: String
+                    if (isCompressedFlag) {
+                        Log.d(TAG, "UserMessage: Decompressing payload of size ${payload.size} for channel '$channel'")
+                        val decompressedPayload = CompressionUtil.decompress(payload, payload.size * 10 + 1024) // Heuristic for output buffer
+                        if (decompressedPayload == null) {
+                            Log.e(TAG, "UserMessage: Failed to decompress message for channel '$channel'. Using raw payload as text (potential error).")
+                            actualText = payload.toString(Charsets.UTF_8)
+                        } else {
+                            actualText = decompressedPayload.toString(Charsets.UTF_8)
+                            Log.i(TAG, "UserMessage: Decompressed payload for channel '$channel' to ${actualText.toByteArray().size}B text.")
+                        }
+                    } else {
+                        actualText = payload.toString(Charsets.UTF_8)
                     }
-                    BitchatMessage.UserMessage(channel, senderDisplayName, payload.toString(Charsets.UTF_8), isPrivate, isCompressed)
+                    BitchatMessage.UserMessage(channel, senderDisplayName, actualText, isPrivate, isCompressedFlag)
                 }
-                0x05.toByte() -> BitchatMessage.Fragment(
-                    UUID(buffer.long, buffer.long),
-                    buffer.int,
-                    buffer.int,
-                    getByteArray(buffer)
-                )
-                0x06.toByte() -> BitchatMessage.Ack(UUID(buffer.long, buffer.long))
+                0x05.toByte() -> BitchatMessage.Fragment(UUID.fromString(dis.readUTF()), dis.readInt(), dis.readInt(), readByteArray(dis))
+                0x06.toByte() -> BitchatMessage.Ack(UUID.fromString(dis.readUTF()))
                 0x07.toByte() -> {
-                    val channel = getString(buffer)
-                    val hasPass = buffer.get() == 1.toByte()
-                    BitchatMessage.ChannelJoinRequest(channel, if(hasPass) getByteArray(buffer) else null)
+                    val channel = dis.readUTF()
+                    val hasPass = dis.readBoolean()
+                    BitchatMessage.ChannelJoinRequest(channel, if(hasPass) readByteArray(dis) else null)
                 }
                 0x08.toByte() -> {
-                    val channel = getString(buffer)
-                    val success = buffer.get() == 1.toByte()
-                    val hasError = buffer.get() == 1.toByte()
-                    BitchatMessage.ChannelJoinResponse(channel, success, if(hasError) getString(buffer) else null)
+                    val channel = dis.readUTF()
+                    val success = dis.readBoolean()
+                    val hasError = dis.readBoolean()
+                    BitchatMessage.ChannelJoinResponse(channel, success, if(hasError) dis.readUTF() else null)
                 }
                 0x09.toByte() -> {
-                    val channel = getString(buffer)
-                    val hasPass = buffer.get() == 1.toByte()
-                    BitchatMessage.ChannelCreateRequest(channel, if(hasPass) getByteArray(buffer) else null)
+                    val channel = dis.readUTF()
+                    val hasPass = dis.readBoolean()
+                    BitchatMessage.ChannelCreateRequest(channel, if(hasPass) readByteArray(dis) else null)
                 }
                 0x0A.toByte() -> {
-                     val channel = getString(buffer)
-                    val success = buffer.get() == 1.toByte()
-                    val hasError = buffer.get() == 1.toByte()
-                    BitchatMessage.ChannelCreateResponse(channel, success, if(hasError) getString(buffer) else null)
+                     val channel = dis.readUTF()
+                    val success = dis.readBoolean()
+                    val hasError = dis.readBoolean()
+                    BitchatMessage.ChannelCreateResponse(channel, success, if(hasError) dis.readUTF() else null)
                 }
                 else -> {
-                    Log.w(TAG, "Unknown message type: $typeByte")
+                    Log.w(TAG, "deserializeMessage: Unknown message type byte: 0x${typeByte.toString(16)}")
                     null
                 }
             }
+        } catch (e: IOException) {
+            Log.e(TAG, "deserializeMessage: IOException: ${e.message}", e)
+            return null
+        } catch (e: IllegalArgumentException) {
+             Log.e(TAG, "deserializeMessage: IllegalArgumentException (e.g. invalid UUID string): ${e.message}", e)
+            return null
         } catch (e: Exception) {
-            Log.e(TAG, "Error deserializing BitchatMessage: ${e.message}", e)
+            Log.e(TAG, "deserializeMessage: Unexpected error: ${e.message}", e)
             return null
         }
     }
 
-    // --- Helper functions for ByteBuffer ---
-    private fun putString(buffer: ByteBuffer, value: String) {
-        val bytes = value.toByteArray(Charsets.UTF_8)
-        buffer.putInt(bytes.size)
-        buffer.put(bytes)
+    // --- Helper functions for DataInputStream/DataOutputStream ---
+    private fun writeByteArray(dos: DataOutputStream, value: ByteArray) {
+        dos.writeInt(value.size)
+        dos.write(value)
     }
 
-    private fun getString(buffer: ByteBuffer): String {
-        val length = buffer.int
+    private fun readByteArray(dis: DataInputStream): ByteArray {
+        val length = dis.readInt()
+        if (length < 0) throw IOException("Invalid array length: $length")
+        if (length > 10 * 1024 * 1024) { // 10MB sanity limit
+            throw IOException("Array length $length exceeds safety limit.")
+        }
         val bytes = ByteArray(length)
-        buffer.get(bytes)
-        return String(bytes, Charsets.UTF_8)
-    }
-
-    private fun putByteArray(buffer: ByteBuffer, value: ByteArray) {
-        buffer.putInt(value.size)
-        buffer.put(value)
-    }
-
-    private fun getByteArray(buffer: ByteBuffer): ByteArray {
-        val length = buffer.int
-        val bytes = ByteArray(length)
-        buffer.get(bytes)
+        dis.readFully(bytes)
         return bytes
     }
 }
