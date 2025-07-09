@@ -9,7 +9,9 @@ import java.security.Security
 import javax.crypto.SecretKey
 import javax.crypto.spec.SecretKeySpec
 // Import BouncyCastle provider if you intend to use it directly in tests or if it's required for specific algorithms
-// import org.bouncycastle.jce.provider.BouncyCastleProvider
+import org.bouncycastle.jce.provider.BouncyCastleProvider
+import java.security.interfaces.ECPrivateKey
+import java.security.interfaces.ECPublicKey
 
 class EncryptionServiceTest {
 
@@ -17,14 +19,105 @@ class EncryptionServiceTest {
 
     @Before
     fun setUp() {
-        // It's good practice to add BouncyCastle provider if you rely on it,
-        // especially for consistent behavior across test environments.
-        // if (Security.getProvider(BouncyCastleProvider.PROVIDER_NAME) == null) {
-        //     Security.addProvider(BouncyCastleProvider())
-        // }
+        // Ensure BouncyCastle provider is added for tests, as the service relies on it.
+        if (Security.getProvider(BouncyCastleProvider.PROVIDER_NAME) == null) {
+            Security.insertProviderAt(BouncyCastleProvider(), 1)
+        }
         encryptionService = EncryptionService()
     }
 
+    // --- Key Generation Tests (X25519 and Ed25519 with BouncyCastle) ---
+    @Test
+    fun generateX25519KeyPair_successful() {
+        val keyPair = encryptionService.generateX25519KeyPair()
+        assertNotNull("X25519 key pair should not be null", keyPair)
+        assertNotNull("X25519 public key should not be null", keyPair?.public)
+        assertNotNull("X25519 private key should not be null", keyPair?.private)
+        // Algorithm check depends on BC's naming, could be "XDH" or "X25519"
+        assertTrue("Public key algorithm should indicate X25519 compatibility", keyPair!!.public.algorithm.contains("XDH", ignoreCase = true) ||  keyPair.public.algorithm.contains("X25519", ignoreCase = true) )
+        assertTrue("Private key algorithm should indicate X25519 compatibility", keyPair.private.algorithm.contains("XDH", ignoreCase = true) ||  keyPair.private.algorithm.contains("X25519", ignoreCase = true))
+    }
+
+    @Test
+    fun generateEd25519KeyPair_successful() {
+        val keyPair = encryptionService.generateEd25519KeyPair()
+        assertNotNull("Ed25519 key pair should not be null", keyPair)
+        assertNotNull("Ed25519 public key should not be null", keyPair?.public)
+        assertNotNull("Ed25519 private key should not be null", keyPair?.private)
+        assertEquals("EdDSA", keyPair!!.public.algorithm) // EdDSA is the umbrella, Ed25519 is the curve
+        assertEquals("EdDSA", keyPair.private.algorithm)
+    }
+
+    // --- Key Agreement Test (X25519 with BouncyCastle) ---
+    @Test
+    fun performKeyAgreement_X25519_successful() {
+        val keyPairA = encryptionService.generateX25519KeyPair()
+        val keyPairB = encryptionService.generateX25519KeyPair()
+        assertNotNull(keyPairA); assertNotNull(keyPairB)
+
+        val secretA = encryptionService.performKeyAgreement(keyPairA!!.private, keyPairB!!.public)
+        val secretB = encryptionService.performKeyAgreement(keyPairB.private, keyPairA.public)
+
+        assertNotNull("Shared secret A should not be null", secretA)
+        assertNotNull("Shared secret B should not be null", secretB)
+        assertArrayEquals("Shared secrets derived by both parties should be identical", secretA, secretB)
+        assertTrue("Shared secret should have a reasonable length (e.g., 32 bytes for X25519)", secretA!!.size == 32)
+    }
+
+    // --- Ed25519 Signature Tests (with BouncyCastle) ---
+    @Test
+    fun signAndVerifyEd25519_successful() {
+        val keyPair = encryptionService.generateEd25519KeyPair()
+        assertNotNull("Ed25519 key pair for signing test should not be null", keyPair)
+        val data = "This is data to be signed with Ed25519".toByteArray()
+
+        val signature = encryptionService.signEd25519(data, keyPair!!.private)
+        assertNotNull("Signature should not be null", signature)
+        assertTrue("Signature should not be empty", signature!!.isNotEmpty())
+
+        val isValid = encryptionService.verifyEd25519(data, signature, keyPair.public)
+        assertTrue("Signature should be valid", isValid)
+    }
+
+    @Test
+    fun verifyEd25519_tamperedData_fails() {
+        val keyPair = encryptionService.generateEd25519KeyPair()!!
+        val originalData = "Original data for signature".toByteArray()
+        val tamperedData = "Tampered data for signature".toByteArray()
+
+        val signature = encryptionService.signEd25519(originalData, keyPair.private)!!
+        val isValid = encryptionService.verifyEd25519(tamperedData, signature, keyPair.public)
+        assertFalse("Verification of tampered data with original signature should fail", isValid)
+    }
+
+    @Test
+    fun verifyEd25519_tamperedSignature_fails() {
+        val keyPair = encryptionService.generateEd25519KeyPair()!!
+        val data = "Data for tampered signature test".toByteArray()
+
+        val signature = encryptionService.signEd25519(data, keyPair.private)!!
+        if (signature.isNotEmpty()) {
+            signature[signature.size / 2] = (signature[signature.size / 2] + 1).toByte() // Tamper signature
+        } else {
+            fail("Signature was empty, cannot tamper.")
+        }
+        val isValid = encryptionService.verifyEd25519(data, signature, keyPair.public)
+        assertFalse("Verification with tampered signature should fail", isValid)
+    }
+
+    @Test
+    fun verifyEd25519_wrongPublicKey_fails() {
+        val keyPair1 = encryptionService.generateEd25519KeyPair()!!
+        val keyPair2 = encryptionService.generateEd25519KeyPair()!! // Different key pair
+        val data = "Data for wrong public key test".toByteArray()
+
+        val signature = encryptionService.signEd25519(data, keyPair1.private)!!
+        val isValid = encryptionService.verifyEd25519(data, signature, keyPair2.public)
+        assertFalse("Verification with wrong public key should fail", isValid)
+    }
+
+
+    // --- HKDF Tests (should remain largely the same) ---
     @Test
     fun hkdf_derivesKeyOfCorrectLength() {
         val ikm = "InitialKeyMaterial".toByteArray()

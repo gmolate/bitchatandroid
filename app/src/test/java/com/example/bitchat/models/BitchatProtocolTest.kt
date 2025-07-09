@@ -8,27 +8,35 @@ import java.util.UUID
 import java.security.SecureRandom
 import javax.crypto.spec.SecretKeySpec
 
-// For these tests, we'll need a mock or a simplified EncryptionService
-// as full crypto operations are not the primary focus here, but serialization might use it.
-class MockEncryptionService : EncryptionService() {
-    // Override methods if they are called during serialization and need specific mock behavior
-    // For now, the default (potentially null-returning) placeholders might be okay if not encrypting.
-}
+import org.bouncycastle.jce.provider.BouncyCastleProvider
+import java.security.Security
 
-
+// Using the actual EncryptionService for these tests now that BouncyCastle is integrated.
+// This makes the tests more of an integration test for protocol + basic crypto.
 class BitchatProtocolTest {
 
-    private lateinit var encryptionService: EncryptionService // Or MockEncryptionService
+    private lateinit var encryptionService: EncryptionService
     private val defaultPeerId = "testPeer123"
     private val defaultDisplayName = "Test User"
     private val defaultChannel = "#testChannel"
+    private lateinit var sampleKeyPair: KeyPair // For Ed25519
+    private lateinit var sampleX25519KeyPair: KeyPair // For X25519
 
     @Before
     fun setUp() {
-        encryptionService = MockEncryptionService() // Use mock for protocol tests
+        if (Security.getProvider(BouncyCastleProvider.PROVIDER_NAME) == null) {
+            Security.insertProviderAt(BouncyCastleProvider(), 1)
+        }
+        encryptionService = EncryptionService()
+        sampleKeyPair = encryptionService.generateEd25519KeyPair()!!
+        sampleX25519KeyPair = encryptionService.generateX25519KeyPair()!!
     }
 
-    private fun createSamplePublicKey(): ByteArray {
+    private fun createSamplePublicKey(): ByteArray { // Ed25519 public key
+        return sampleKeyPair.public.encoded
+    }
+
+    private fun createSampleX25519PublicKey(): ByteArray {
         val bytes = ByteArray(32)
         SecureRandom().nextBytes(bytes)
         return bytes
