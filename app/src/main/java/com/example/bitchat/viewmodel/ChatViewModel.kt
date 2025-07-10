@@ -311,12 +311,13 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         Log.i(TAG, "Handling command: /$command, Args: $args")
 
         when (command) {
-            "join" -> args?.let { changeChannelByName(it.trim()) } // Use new name
+            "join" -> args?.let { changeChannelByName(it.trim()) }
             "nick" -> args?.let { newNick -> changeDisplayNameUserInitiated(newNick.trim()) }
             "id" -> showMyId()
             "clear" -> clearCurrentChannelMessages()
             "announce" -> viewModelScope.launch { announceSelf() }
             "createchannel" -> args?.let { requestCreateChannel(it.trim(), emptyList(), false, null) }
+            "sync" -> args?.let { requestPeerStateSync(it.trim()) } // Example: /sync <peer_address_or_id>
             else -> {
                  addMessageToUi("System", "Unknown command: /$command", false, _currentChannel.value)
             }

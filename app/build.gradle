@@ -23,7 +23,7 @@ android {
 
     buildTypes {
         release {
-            minifyEnabled false // Consider enabling for production
+            minifyEnabled true // Enabled for production
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
         }
         debug {

@@ -132,6 +132,30 @@ sealed class BitchatMessage {
         val success: Boolean,
         val error: String? = null
     ) : BitchatMessage() { override val typeByte: Byte = 0x0A }
+
+    // --- State Synchronization Messages (Conceptual Skeleton) ---
+    /**
+     * Requests state synchronization from a peer.
+     * Could include hashes of known messages, channel states, etc., to help the peer determine what's missing.
+     * For now, a simple request.
+     */
+    data class StateSyncRequest(
+        val sinceTimestamp: Long? = null, // Optional: request updates since a certain time
+        val requestedChannelIds: List<String>? = null // Optional: request sync for specific channels
+        // Future: Could include bloom filters of known message IDs for more efficient diffing.
+    ) : BitchatMessage() { override val typeByte: Byte = 0x0B }
+
+    /**
+     * Responds to a StateSyncRequest with relevant state information.
+     * The actual content would be complex (e.g., list of recent messages, channel member updates).
+     * For now, a placeholder.
+     */
+    data class StateSyncResponse(
+        val forPeerId: String, // The peerId this sync response is intended for
+        val messages: List<BitchatPacket>? = null, // Example: send missing messages (could be just BitchatMessage objects)
+        val channelUpdates: List<ChannelInfo>? = null // Example: send channel updates
+        // Future: Could include more granular updates.
+    ) : BitchatMessage() { override val typeByte: Byte = 0x0C }
 }
 
 
@@ -340,6 +364,26 @@ object BinaryProtocol {
                     dos.writeBoolean(message.error != null)
                     message.error?.let { dos.writeUTF(it) }
                 }
+                is BitchatMessage.StateSyncRequest -> {
+                    dos.writeBoolean(message.sinceTimestamp != null)
+                    message.sinceTimestamp?.let { dos.writeLong(it) }
+                    dos.writeBoolean(message.requestedChannelIds != null)
+                    message.requestedChannelIds?.let { ids ->
+                        dos.writeInt(ids.size)
+                        ids.forEach { dos.writeUTF(it) }
+                    }
+                }
+                is BitchatMessage.StateSyncResponse -> {
+                    dos.writeUTF(message.forPeerId)
+                    // Serializing lists of complex objects like BitchatPacket or ChannelInfo here
+                    // would require careful handling and might be too large for a single message.
+                    // This is a placeholder; actual sync would likely use smaller, more targeted messages
+                    // or a multi-message exchange. For now, just indicate presence.
+                    dos.writeBoolean(message.messages != null)
+                    // If sending messages: dos.writeInt(message.messages.size); message.messages.forEach { serializePacket(it, ...) } - recursive, careful!
+                    dos.writeBoolean(message.channelUpdates != null)
+                    // If sending channel updates: dos.writeInt(message.channelUpdates.size); message.channelUpdates.forEach { serializeChannelInfo(it, dos) }
+                }
             }
             dos.flush()
             val resultBytes = baos.toByteArray()
@@ -445,13 +489,33 @@ object BinaryProtocol {
                     val hasError = dis.readBoolean()
                     BitchatMessage.ChannelCreateResponse(channel, success, if(hasError) dis.readUTF() else null)
                 }
+                0x0B.toByte() -> { // StateSyncRequest
+                    val hasTimestamp = dis.readBoolean()
+                    val timestamp = if (hasTimestamp) dis.readLong() else null
+                    val hasChannelIds = dis.readBoolean()
+                    val channelIds = if (hasChannelIds) {
+                        val count = dis.readInt()
+                        List(count) { dis.readUTF() }
+                    } else null
+                    BitchatMessage.StateSyncRequest(timestamp, channelIds)
+                }
+                0x0C.toByte() -> { // StateSyncResponse
+                    val forPeerId = dis.readUTF()
+                    val hasMessages = dis.readBoolean()
+                    // Actual deserialization of lists of packets/channelInfos would be complex here.
+                    // This is a placeholder for the structure.
+                    val messages = if (hasMessages) emptyList<BitchatPacket>() else null // Placeholder
+                    val hasChannelUpdates = dis.readBoolean()
+                    val channelUpdates = if (hasChannelUpdates) emptyList<ChannelInfo>() else null // Placeholder
+                    BitchatMessage.StateSyncResponse(forPeerId, messages, channelUpdates)
+                }
                 else -> {
                     Log.w(TAG, "deserializeMessage: Unknown message type byte: 0x${typeByte.toString(16)}")
                     null
                 }
             }
         } catch (e: IOException) {
-            Log.e(TAG, "deserializeMessage: IOException: ${e.message}", e)
+            Log.e(TAG, "deserializeMessage: IOException (TypeByte: 0x${typeByte.toString(16)}): ${e.message}", e)
             return null
         } catch (e: IllegalArgumentException) {
              Log.e(TAG, "deserializeMessage: IllegalArgumentException (e.g. invalid UUID string): ${e.message}", e)
