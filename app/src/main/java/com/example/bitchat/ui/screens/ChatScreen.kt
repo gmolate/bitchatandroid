@@ -48,7 +48,8 @@ fun ChatScreen(chatViewModel: ChatViewModel = viewModel()) {
     val connectedPeersCount by chatViewModel.connectedPeers.map { it.size }.collectAsState(initial = 0)
     val isSendingMessage by chatViewModel.isSendingMessage.collectAsState()
     val errorMessage by chatViewModel.errorMessage.collectAsState()
-    val isBluetoothReady by chatViewModel.isBluetoothReady.collectAsState()
+    // val isBluetoothReady by chatViewModel.isBluetoothReady.collectAsState() // Replaced by bleOperationState
+    val bleOperationState by chatViewModel.bleOperationState.collectAsState()
 
 
     val context = LocalContext.current
@@ -124,24 +125,28 @@ fun ChatScreen(chatViewModel: ChatViewModel = viewModel()) {
                         Text("BitChat: $currentChannel ($displayName)")
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             Text("Peers: $connectedPeersCount", style = MaterialTheme.typography.titleSmall)
-                            Spacer(Modifier.width(8.dp))
-                            if (isBluetoothReady) {
-                                Icon(
-                                    Icons.Filled.BluetoothSearching, // Example icon
-                                    contentDescription = "Bluetooth Active",
-                                    tint = MaterialTheme.colorScheme.onPrimaryContainer,
-                                    modifier = Modifier.size(18.dp)
-                                )
-                                Text(" (Active)", style = MaterialTheme.typography.labelMedium)
-                            } else {
-                                Icon(
-                                    Icons.Filled.BluetoothDisabled, // Example icon
-                                    contentDescription = "Bluetooth Inactive",
-                                    tint = MaterialTheme.colorScheme.error,
-                                    modifier = Modifier.size(18.dp)
-                                )
-                                Text(" (Inactive)", style = MaterialTheme.typography.labelMedium)
+                            Spacer(Modifier.width(12.dp)) // Increased spacing
+
+                            val (bleIcon, bleText, bleIconColor) = when (bleOperationState) {
+                                BluetoothMeshService.BleOperationState.IDLE -> Triple(Icons.Filled.Bluetooth, "Idle", MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.7f))
+                                BluetoothMeshService.BleOperationState.SCANNING -> Triple(Icons.Filled.BluetoothSearching, "Scanning", MaterialTheme.colorScheme.onPrimaryContainer)
+                                BluetoothMeshService.BleOperationState.ADVERTISING -> Triple(Icons.Filled.VolumeUp, "Advertising", MaterialTheme.colorScheme.onPrimaryContainer) // Example icon for advertising
+                                BluetoothMeshService.BleOperationState.CONNECTING_TO_PEER -> Triple(Icons.Filled.CompareArrows, "Connecting...", MaterialTheme.colorScheme.onPrimaryContainer)
+                                BluetoothMeshService.BleOperationState.CONNECTED_AS_CLIENT -> Triple(Icons.Filled.BluetoothConnected, "Client Mode", MaterialTheme.colorScheme.onPrimaryContainer)
+                                BluetoothMeshService.BleOperationState.CONNECTED_AS_SERVER -> Triple(Icons.Filled.SettingsBluetooth, "Server Mode", MaterialTheme.colorScheme.onPrimaryContainer)
+                                BluetoothMeshService.BleOperationState.ERROR_PERMISSIONS -> Triple(Icons.Filled.LockClock, "Permissions Needed", MaterialTheme.colorScheme.error)
+                                BluetoothMeshService.BleOperationState.ERROR_BLUETOOTH_OFF -> Triple(Icons.Filled.BluetoothDisabled, "Bluetooth Off", MaterialTheme.colorScheme.error)
+                                BluetoothMeshService.BleOperationState.ERROR_GENERIC -> Triple(Icons.Filled.ErrorOutline, "BLE Error", MaterialTheme.colorScheme.error)
                             }
+
+                            Icon(
+                                imageVector = bleIcon,
+                                contentDescription = "BLE Status: $bleText",
+                                tint = bleIconColor,
+                                modifier = Modifier.size(18.dp)
+                            )
+                            Spacer(Modifier.width(4.dp))
+                            Text(bleText, style = MaterialTheme.typography.labelMedium, color = bleIconColor)
                         }
                     }
                 },
@@ -397,6 +402,14 @@ fun ChatScreenPreviewDark() {
 
 // Icons used
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Bluetooth
+import androidx.compose.material.icons.filled.BluetoothConnected
 import androidx.compose.material.icons.filled.BluetoothDisabled
 import androidx.compose.material.icons.filled.BluetoothSearching
+import androidx.compose.material.icons.filled.CompareArrows
+import androidx.compose.material.icons.filled.ErrorOutline
+import androidx.compose.material.icons.filled.LockClock
 import androidx.compose.material.icons.filled.Send
+import androidx.compose.material.icons.filled.SettingsBluetooth
+import androidx.compose.material.icons.filled.VolumeUp
+import com.example.bitchat.services.BluetoothMeshService

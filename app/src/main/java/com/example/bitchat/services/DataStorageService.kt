@@ -3,7 +3,7 @@ package com.example.bitchat.services
 import android.content.Context
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
-import android.util.Base64 // Using android.util.Base64 for consistency
+import android.util.Base64
 import android.util.Log
 import androidx.datastore.core.DataStore
 import androidx.datastore.preferences.core.Preferences
@@ -11,7 +11,8 @@ import androidx.datastore.preferences.core.edit as dsEdit
 import androidx.datastore.preferences.core.emptyPreferences
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
-import com.example.bitchat.viewmodel.UiMessage // Assuming UiMessage is in viewmodel package
+import com.example.bitchat.models.ChannelInfo // Import ChannelInfo
+import com.example.bitchat.viewmodel.UiMessage
 import com.google.gson.Gson
 import com.google.gson.reflect.TypeToken
 import kotlinx.coroutines.flow.Flow
@@ -20,28 +21,29 @@ import kotlinx.coroutines.flow.firstOrNull
 import kotlinx.coroutines.flow.map
 import java.io.IOException
 import java.security.KeyPair
-import java.security.KeyPairGenerator // Added for Identity Key generation directly in Keystore
+import java.security.KeyPairGenerator
 import java.security.KeyStore
 import java.security.PrivateKey
 import java.security.PublicKey
 import javax.crypto.Cipher
-import javax.crypto.KeyGenerator // Added for Channel Wrapping Key generation
+import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
 import javax.crypto.spec.GCMParameterSpec
 import javax.crypto.spec.SecretKeySpec
 import java.util.concurrent.ConcurrentHashMap
 
 
-val Context.dataStore: DataStore<Preferences> by preferencesDataStore(name = "bitchat_settings_v2") // v2 for safety with new structures
+val Context.dataStore: DataStore<Preferences> by preferencesDataStore(name = "bitchat_settings_v2")
 
 class DataStorageService(private val context: Context) {
 
     companion object {
-        private const val TAG = "BitChatDataStore" // Consistent TAG prefix
+        private const val TAG = "BitChatDataStore"
 
         val DISPLAY_NAME_DS_KEY = stringPreferencesKey("display_name_ds_v2")
         val USER_EPHEMERAL_ID_DS_KEY = stringPreferencesKey("user_ephemeral_id_ds_v2")
         val PEER_PUBLIC_KEYS_DS_KEY = stringPreferencesKey("peer_public_keys_map_v3")
+        val CHANNELS_LIST_DS_KEY = stringPreferencesKey("channels_list_json_v1") // Key for storing list of channels
 
         private const val ANDROID_KEYSTORE_PROVIDER = "AndroidKeyStore"
         private const val IDENTITY_KEY_ALIAS = "BitChat_UserIdentityKey_Ed25519_v2"
@@ -53,11 +55,12 @@ class DataStorageService(private val context: Context) {
     private val gson = Gson()
     private val uiMessageListTypeToken = object : TypeToken<List<UiMessage>>() {}.type
     private val peerPublicKeysMapTypeToken = object : TypeToken<Map<String, String>>() {}.type
+    private val channelInfoListTypeToken = object : TypeToken<List<ChannelInfo>>() {}.type // TypeToken for List<ChannelInfo>
+
 
     private val peerPublicKeysCache = ConcurrentHashMap<String, ByteArray>()
-    private val channelKeyCache = ConcurrentHashMap<String, SecretKey>() // Cache for decrypted channel keys
+    private val channelKeyCache = ConcurrentHashMap<String, SecretKey>()
 
-    // --- User Preferences ---
     val displayNameFlow: Flow<String?> = context.dataStore.data
         .catch { exception ->
             Log.e(TAG, "Error reading displayNameFlow from DataStore.", exception)
@@ -91,7 +94,6 @@ class DataStorageService(private val context: Context) {
         return id
     }
 
-    // --- Persistent Identity Key (Ed25519 using Android Keystore) ---
     fun getOrGenerateIdentityKeyPair(): KeyPair? {
         Log.d(TAG, "Attempting to get or generate Ed25519 identity key pair from Android Keystore (Alias: $IDENTITY_KEY_ALIAS).")
         try {
@@ -109,11 +111,7 @@ class DataStorageService(private val context: Context) {
                     IDENTITY_KEY_ALIAS,
                     KeyProperties.PURPOSE_SIGN or KeyProperties.PURPOSE_VERIFY
                 ).run {
-                    // For Ed25519, KeyProperties.KEY_ALGORITHM_EC with EdDSA signature scheme is used.
-                    // Android P (API 28) added support for Ed25519.
-                    // No explicit curve needed if KeyPairGenerator with "AndroidKeyStore" handles "EC" for Ed25519.
-                    // setAlgorithmParameterSpec(EdDSAParameterSpec(EdDSAParameterSpec.ED25519)) // Might be needed if using BC directly
-                    setDigests(KeyProperties.DIGEST_NONE) // EdDSA performs its own hashing
+                    setDigests(KeyProperties.DIGEST_NONE)
                     build()
                 }
                 kpg.initialize(parameterSpec)
@@ -127,7 +125,6 @@ class DataStorageService(private val context: Context) {
         }
     }
 
-    // --- Channel Password Derived Key Storage (AES key wrapping in Keystore) ---
     fun saveChannelKey(channelName: String, keyToProtect: SecretKey): Boolean {
         val alias = CHANNEL_PASSWORD_KEY_ALIAS_PREFIX + channelName.hashCode().toString()
         Log.d(TAG, "Saving channel key for '$channelName' using Keystore alias '$alias'. Key to protect length: ${keyToProtect.encoded.size}B")
@@ -148,7 +145,7 @@ class DataStorageService(private val context: Context) {
 
             val keystoreWrappingKey = keyStore.getKey(alias, null) as SecretKey
             val cipher = Cipher.getInstance(KEYSTORE_AES_GCM_TRANSFORMATION)
-            cipher.init(Cipher.ENCRYPT_MODE, keystoreWrappingKey) // IV is generated by Cipher for encryption
+            cipher.init(Cipher.ENCRYPT_MODE, keystoreWrappingKey)
 
             val encryptedKey = cipher.doFinal(keyToProtect.encoded)
             val iv = cipher.iv
@@ -158,7 +155,7 @@ class DataStorageService(private val context: Context) {
                 settings[stringPreferencesKey("enc_channel_iv_b64_$channelName")] = Base64.encodeToString(iv, Base64.NO_WRAP)
             }
             Log.i(TAG, "Channel key for '$channelName' (size ${keyToProtect.encoded.size}B) encrypted (to ${encryptedKey.size}B with ${iv.size}B IV) and stored.")
-            channelKeyCache[channelName] = keyToProtect // Cache the original key
+            channelKeyCache[channelName] = keyToProtect
             return true
         } catch (e: Exception) {
             Log.e(TAG, "Error saving channel key for '$channelName': ${e.message}", e)
@@ -223,7 +220,6 @@ class DataStorageService(private val context: Context) {
         }
     }
 
-    // --- Message Persistence ---
     private fun dsKeyMessagesForChannel(channelName: String) = stringPreferencesKey("messages_json_${channelName.replace("#", "")}_v2")
 
     suspend fun addMessageToChannel(channelName: String, message: UiMessage) {
@@ -290,7 +286,6 @@ class DataStorageService(private val context: Context) {
         Log.i(TAG, "All channel messages cleared from DataStore.")
     }
 
-    // --- Peer Public Key Management ---
     suspend fun preloadPeerPublicKeysCache() {
         if (peerPublicKeysCache.isEmpty()) {
             Log.i(TAG, "Preloading peer public keys into cache.")
@@ -335,10 +330,9 @@ class DataStorageService(private val context: Context) {
             return it
         }
         Log.d(TAG, "Public key for peer '$peerId' not in cache. Attempting to load from DataStore (will load all if cache was empty).")
-        // Ensure cache is populated if it was empty
         if (peerPublicKeysCache.isEmpty()) { preloadPeerPublicKeysCache() }
 
-        val keyFromStore = peerPublicKeysCache[peerId] // Try again after potential preload
+        val keyFromStore = peerPublicKeysCache[peerId]
         if (keyFromStore != null) {
              Log.d(TAG, "Retrieved public key for peer '$peerId' from DataStore (via cache refresh).")
         } else {
@@ -359,6 +353,49 @@ class DataStorageService(private val context: Context) {
         }
         Log.i(TAG, "Saving/Updating public key for peer '$peerId' (Size: ${publicKey.size}B). Current cache size: ${peerPublicKeysCache.size}")
         peerPublicKeysCache[peerId] = publicKey
-        savePeerPublicKeysToDataStore(HashMap(peerPublicKeysCache)) // Save a copy of the cache
+        savePeerPublicKeysToDataStore(HashMap(peerPublicKeysCache))
+    }
+
+    // --- Channel List Persistence ---
+    val channelsFlow: Flow<List<ChannelInfo>> = context.dataStore.data
+        .catch { exception ->
+            Log.e(TAG, "Error reading channelsFlow from DataStore (Key: ${CHANNELS_LIST_DS_KEY.name}).", exception)
+            if (exception is IOException) emit(emptyPreferences()) else throw exception
+        }
+        .map { preferences ->
+            val jsonString = preferences[CHANNELS_LIST_DS_KEY]
+            if (jsonString != null) {
+                try {
+                    val channels: List<ChannelInfo> = gson.fromJson(jsonString, channelInfoListTypeToken) ?: emptyList()
+                    Log.d(TAG, "Loaded ${channels.size} channels from DataStore.")
+                    channels
+                } catch (e: Exception) {
+                    Log.e(TAG, "Error parsing channels JSON from DataStore.", e)
+                    emptyList()
+                }
+            } else {
+                Log.d(TAG, "No channels JSON found in DataStore (Key: ${CHANNELS_LIST_DS_KEY.name}). Returning empty list.")
+                emptyList()
+            }
+        }
+
+    suspend fun saveChannels(channels: List<ChannelInfo>) {
+        Log.i(TAG, "Saving ${channels.size} channels to DataStore (Key: ${CHANNELS_LIST_DS_KEY.name}).")
+        try {
+            val jsonString = gson.toJson(channels)
+            context.dataStore.dsEdit { settings ->
+                settings[CHANNELS_LIST_DS_KEY] = jsonString
+            }
+            Log.i(TAG, "Channels list saved to DataStore (JSON size: ${jsonString.length}). First channel: ${channels.firstOrNull()?.name}")
+        } catch (e: Exception) {
+            Log.e(TAG, "Error saving channels list to DataStore: ${e.message}", e)
+        }
+    }
+
+    suspend fun getChannels(): List<ChannelInfo> {
+        Log.d(TAG, "Getting current list of channels directly from channelsFlow.")
+        return channelsFlow.firstOrNull() ?: emptyList<ChannelInfo>().also {
+            Log.w(TAG, "getChannels: channelsFlow emitted null or was empty, returning fresh empty list.")
+        }
     }
 }

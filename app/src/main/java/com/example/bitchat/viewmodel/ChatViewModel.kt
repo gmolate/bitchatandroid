@@ -5,17 +5,20 @@ import android.bluetooth.BluetoothDevice
 import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
-import com.example.bitchat.MainActivity // Assuming for isAppInForeground check
+import com.example.bitchat.MainActivity
 import com.example.bitchat.data.MessageRepository
+import com.example.bitchat.data.ChannelRepository // Import ChannelRepository
 import com.example.bitchat.models.BitchatMessage
 import com.example.bitchat.models.BitchatPacket
 import com.example.bitchat.models.BinaryProtocol
+import com.example.bitchat.models.ChannelInfo // Import ChannelInfo
 import com.example.bitchat.services.BluetoothMeshService
 import com.example.bitchat.services.DataStorageService
 import com.example.bitchat.services.EncryptionService
-import com.example.bitchat.services.MessageMetadataService // Assuming this service exists
-import com.example.bitchat.services.NotificationService // Assuming this service exists
+import com.example.bitchat.services.MessageMetadataService
+import com.example.bitchat.services.NotificationService
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -23,13 +26,7 @@ import java.security.PrivateKey
 import java.security.PublicKey
 import java.util.Locale
 import java.util.UUID
-// Remove javax.crypto.spec.SecretKeySpec if not directly used here for shared secrets
-// import javax.crypto.spec.SecretKeySpec // Example, if creating shared secrets directly
 
-/**
- * Represents a message object tailored for display in the UI.
- * Matches the existing UiMessage in the provided ChatViewModel code.
- */
 data class UiMessage(
     val id: UUID = UUID.randomUUID(),
     val senderName: String,
@@ -39,7 +36,6 @@ data class UiMessage(
     val channel: String
 )
 
-
 class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     companion object {
@@ -47,21 +43,19 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         private const val DEFAULT_CHANNEL = "#general"
     }
 
-    // --- Dependencies ---
     private val dataStorageService = DataStorageService(application)
     private val encryptionSvc = EncryptionService()
     private val messageRepository: MessageRepository = MessageRepository(dataStorageService)
-    private val notificationService = NotificationService(application) // Instantiate if needed
+    private val channelRepository: ChannelRepository = ChannelRepository(dataStorageService) // Instantiate ChannelRepository
+    private val notificationService = NotificationService(application)
 
     private var bluetoothMeshService: BluetoothMeshService? = null
-    private var messageMetadataService: MessageMetadataService? = null // Will be set via setBluetoothServices
+    private var messageMetadataService: MessageMetadataService? = null
 
-    // --- User Identity ---
     private var currentUserPublicKey: PublicKey? = null
     private var currentUserPrivateKey: PrivateKey? = null
-    private var ephemeralPeerId: String = UUID.randomUUID().toString() // Default, will be loaded/generated
+    private var ephemeralPeerId: String = UUID.randomUUID().toString()
 
-    // --- UI State ---
     private val _messages = MutableStateFlow<List<UiMessage>>(emptyList())
     val messages: StateFlow<List<UiMessage>> = _messages.asStateFlow()
 
@@ -74,8 +68,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private val _displayName = MutableStateFlow("User")
     val displayName: StateFlow<String> = _displayName.asStateFlow()
 
-    private val _isBluetoothReady = MutableStateFlow(false) // Reflects scanning/advertising state
-    val isBluetoothReady: StateFlow<Boolean> = _isBluetoothReady.asStateFlow()
+    private val _bleOperationState = MutableStateFlow(BluetoothMeshService.BleOperationState.IDLE)
+    val bleOperationState: StateFlow<BluetoothMeshService.BleOperationState> = _bleOperationState.asStateFlow()
 
     private val _connectedPeers = MutableStateFlow<List<BluetoothDevice>>(emptyList())
     val connectedPeers: StateFlow<List<BluetoothDevice>> = _connectedPeers.asStateFlow()
@@ -86,80 +80,102 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private val _errorMessage = MutableStateFlow<String?>(null)
     val errorMessage: StateFlow<String?> = _errorMessage.asStateFlow()
 
+    // --- Channel Management State ---
+    private val _allChannels = MutableStateFlow<List<ChannelInfo>>(emptyList())
+    val allChannels: StateFlow<List<ChannelInfo>> = _allChannels.asStateFlow()
+
     init {
-        Log.d(TAG, "ViewModel initialized.")
+        Log.i(TAG, "ViewModel initialized. Instance: ${this.hashCode()}")
         viewModelScope.launch {
-            dataStorageService.preloadPeerPublicKeysCache() // Preload known peer keys
-            loadAndPrepareUserIdentity() // Load keys, then ID, then announce
+            dataStorageService.preloadPeerPublicKeysCache()
+            channelRepository.ensureDefaultChannelExists(DEFAULT_CHANNEL) // Ensure default channel exists
+            loadAndPrepareUserIdentity()
         }
         observeCurrentChannelMessages()
-        // observeBluetoothServiceStates and observeMessageStatusUpdates are called in setBluetoothServices
-        // observeIncomingPackets is also called in setBluetoothServices (via processedReceivedPacketsFlow)
+        observeAllChannels() // Observe the list of all channels
+        loadDisplayName()
+    }
+
+    private fun observeAllChannels() {
+        Log.d(TAG, "Setting up observer for all channels list.")
+        channelRepository.allChannelsFlow
+            .catch { e -> Log.e(TAG, "Error in allChannelsFlow: ${e.message}", e) }
+            .onEach { channels ->
+                Log.i(TAG, "All channels list updated in ViewModel. Count: ${channels.size}. Channels: ${channels.joinToString { it.name }}")
+                _allChannels.value = channels // Already sorted by repo or can be sorted here if needed
+            }
+            .launchIn(viewModelScope)
     }
 
     private suspend fun loadAndPrepareUserIdentity() {
-        loadCurrentUserKeys() // Loads or generates Ed25519 keys
-        generateAndLoadEphemeralId() // Loads or generates ephemeral ID
-        // Announce self once both keys and ephemeral ID are confirmed
+        Log.d(TAG, "Starting to load and prepare user identity.")
+        loadCurrentUserKeys()
+        generateAndLoadEphemeralId()
         if (currentUserPublicKey != null && currentUserPrivateKey != null && ephemeralPeerId.isNotEmpty()) {
+            Log.i(TAG, "User identity fully prepared. Announcing self.")
             announceSelf()
         } else {
-            Log.w(TAG, "User identity not fully ready after load; self-announce deferred.")
+            Log.w(TAG, "User identity not fully ready after load; self-announce deferred. PubKey: ${currentUserPublicKey!=null}, PrivKey: ${currentUserPrivateKey!=null}, EphID: $ephemeralPeerId")
         }
     }
 
     private suspend fun loadCurrentUserKeys() {
+        Log.d(TAG, "Loading current user Ed25519 keys...")
         withContext(Dispatchers.IO) {
-            val keyPair = dataStorageService.getOrGenerateIdentityKeyPair() // From Android Keystore
+            val keyPair = dataStorageService.getOrGenerateIdentityKeyPair()
             if (keyPair != null) {
                 currentUserPublicKey = keyPair.public
                 currentUserPrivateKey = keyPair.private
                 Log.i(TAG, "User Ed25519 identity keys loaded/generated successfully.")
             } else {
                 Log.e(TAG, "CRITICAL: Failed to load or generate user identity keys.")
-                _errorMessage.value = "Error: Could not initialize user identity. Messaging will fail."
+                _errorMessage.value = "Fatal Error: Could not initialize user identity. Messaging will be impaired."
             }
         }
     }
 
     private suspend fun generateAndLoadEphemeralId() {
+        Log.d(TAG, "Loading/Generating ephemeral peer ID...")
         val storedId = dataStorageService.getUserEphemeralId()
         if (storedId != null) {
             ephemeralPeerId = storedId
-            Log.d(TAG, "Loaded ephemeral peer ID: $ephemeralPeerId")
+            Log.i(TAG, "Loaded ephemeral peer ID: $ephemeralPeerId")
         } else {
-            ephemeralPeerId = UUID.randomUUID().toString() // Generate new one
+            ephemeralPeerId = UUID.randomUUID().toString()
             dataStorageService.saveUserEphemeralId(ephemeralPeerId)
-            Log.d(TAG, "Generated and saved new ephemeral peer ID: $ephemeralPeerId")
+            Log.i(TAG, "Generated and saved new ephemeral peer ID: $ephemeralPeerId")
         }
-        // Update displayName if it's the default "User" to include part of the new ID
-        if (_displayName.value == "User") {
+        if (_displayName.value == "User" || _displayName.value.startsWith("User-")) {
             val defaultName = "User-${ephemeralPeerId.substring(0, 4)}"
             _displayName.value = defaultName
-            dataStorageService.saveDisplayName(defaultName) // Save the generated default name
+            dataStorageService.saveDisplayName(defaultName)
+            Log.i(TAG, "Set default display name to $defaultName")
         }
     }
 
-    private fun loadDisplayName() { // Called from init before generateAndLoadEphemeralId potentially updates it
+    private fun loadDisplayName() {
         viewModelScope.launch {
-            dataStorageService.displayNameFlow.firstOrNull()?.let { name ->
-                _displayName.value = name
+            val name = dataStorageService.displayNameFlow.firstOrNull()
+            if (name != null && name != "User" && !name.startsWith("User-")) {
+                 _displayName.value = name
+                 Log.i(TAG, "Loaded display name: $name")
+            } else {
+                Log.d(TAG, "No custom display name found, will use/generate default if needed after ephemeral ID.")
             }
-            // If still "User" after this, generateAndLoadEphemeralId will set a default like User-xxxx
-             Log.d(TAG, "Initial display name loaded: ${_displayName.value}")
         }
     }
-
 
     private fun observeCurrentChannelMessages() {
+        Log.d(TAG, "Setting up observer for current channel messages.")
         viewModelScope.launch {
             _currentChannel.flatMapLatest { channelName ->
+                Log.d(TAG, "Current channel changed to $channelName, re-observing messages.")
                 messageRepository.getMessagesForChannel(channelName)
             }.catch { e ->
                 Log.e(TAG, "Error observing messages for ${currentChannel.value}: ${e.message}", e)
                 _errorMessage.value = "Error loading messages for ${currentChannel.value}."
             }.collect { channelMessages ->
-                Log.d(TAG, "Loaded ${channelMessages.size} messages for channel ${currentChannel.value}")
+                Log.d(TAG, "Received ${channelMessages.size} messages for channel ${currentChannel.value}")
                 _messages.value = channelMessages
             }
         }
@@ -170,8 +186,16 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun sendMessage(text: String) {
-        if (text.isBlank() || _isSendingMessage.value) return
         val currentText = text.trim()
+        Log.d(TAG, "sendMessage called with text: \"$currentText\"")
+        if (currentText.isBlank()) {
+            Log.w(TAG, "Attempted to send blank message.")
+            return
+        }
+        if (_isSendingMessage.value) {
+            Log.w(TAG, "Already sending a message, new message \"$currentText\" attempt ignored.")
+            return
+        }
         _inputText.value = ""
 
         if (currentText.startsWith("/")) {
@@ -181,11 +205,13 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
         val currentPrivKey = currentUserPrivateKey
         if (currentPrivKey == null) {
-            viewModelScope.launch { _errorMessage.value = "Cannot send message: User identity not ready (no private key)." }
+            Log.e(TAG, "Cannot send message: User private key is not available.")
+            viewModelScope.launch { _errorMessage.value = "Cannot send: Identity not ready." }
             return
         }
         if (bluetoothMeshService == null) {
-            viewModelScope.launch { _errorMessage.value = "Cannot send message: Bluetooth service not available." }
+            Log.e(TAG, "Cannot send message: Bluetooth service not available.")
+            viewModelScope.launch { _errorMessage.value = "Cannot send: Bluetooth not ready." }
             return
         }
 
@@ -201,17 +227,18 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             isFromCurrentUser = true,
             channel = _currentChannel.value
         )
-        // Optimistic UI update
         _messages.value = (_messages.value + optimisticUiMessage).sortedBy { it.timestamp }
+        Log.d(TAG, "Optimistic UI update for message ${optimisticUiMessage.id}.")
 
         viewModelScope.launch(Dispatchers.IO) {
+            Log.d(TAG, "Preparing to send message ID ${optimisticPacketId} in background.")
             try {
                 val bitchatMessage = BitchatMessage.UserMessage(
                     channel = _currentChannel.value,
                     senderDisplayName = _displayName.value,
                     text = currentText,
-                    isPrivate = false, // TODO: Implement private messaging logic
-                    isCompressed = false // TODO: Implement compression decision logic
+                    isPrivate = false,
+                    isCompressed = true
                 )
 
                 val serializedMessagePayload = BinaryProtocol.serializeMessage(bitchatMessage, encryptionSvc, null)
@@ -222,17 +249,18 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     _isSendingMessage.value = false
                     return@launch
                 }
+                Log.d(TAG, "UserMessage ${optimisticPacketId} serialized to ${serializedMessagePayload.size} bytes.")
 
                 val packet = BitchatPacket(
                     id = optimisticPacketId,
                     sourceId = ephemeralPeerId,
-                    message = bitchatMessage, // Store the object for context
-                    messagePayloadBytes = serializedMessagePayload, // Crucial for signing
-                    timestamp = optimisticTimestamp, // Use optimistic timestamp for packet too
+                    message = bitchatMessage,
+                    messagePayloadBytes = serializedMessagePayload,
+                    timestamp = optimisticTimestamp,
                     ttl = 5
                 )
 
-                val dataToSign = packet.dataToSign() // Uses packet.messagePayloadBytes
+                val dataToSign = packet.dataToSign()
                 val signature = encryptionSvc.signEd25519(dataToSign, currentPrivKey)
                 if (signature == null) {
                     Log.e(TAG, "Failed to sign packet ${packet.id}.")
@@ -242,8 +270,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     return@launch
                 }
                 packet.signature = signature
+                Log.d(TAG, "Packet ${packet.id} signed with signature length ${signature.size}.")
 
-                val finalPacketBytes = BinaryProtocol.serializePacket(packet, encryptionSvc, null) // Pass null for sharedSecret for public messages
+                val finalPacketBytes = BinaryProtocol.serializePacket(packet, encryptionSvc, null)
                 if (finalPacketBytes == null) {
                     Log.e(TAG, "Failed to serialize the final BitchatPacket ${packet.id}")
                     _errorMessage.value = "Error: Could not finalize message packet."
@@ -251,19 +280,14 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     _isSendingMessage.value = false
                     return@launch
                 }
+                Log.d(TAG, "Final packet ${packet.id} serialized to ${finalPacketBytes.size} bytes.")
 
-                Log.d(TAG, "Requesting BluetoothMeshService to send ${finalPacketBytes.size} bytes for packet ${packet.id}")
                 messageMetadataService?.trackNewOutgoingMessage(packet, null)
                 bluetoothMeshService?.sendDataToPeers(finalPacketBytes, packet)
 
-                // Persist the message that was actually sent (with packet's timestamp)
-                // The optimistic UI message already uses this ID and timestamp.
-                // We just ensure it's saved to the repository.
-                messageRepository.saveMessage(_currentChannel.value, optimisticUiMessage) // ID and timestamp match packet
-
-                // isSendingMessage will be set to false by MessageMetadataService update or timeout
-                // For now, let's assume it's quick for this example, or rely on MessageMetadataService
-                // _isSendingMessage.value = false // Or handle this based on ack/timeout from MessageMetadataService
+                messageRepository.saveMessage(_currentChannel.value, optimisticUiMessage)
+                channelRepository.updateChannelLastActivity(_currentChannel.value, optimisticTimestamp) // Update channel activity
+                Log.i(TAG, "Message ID ${packet.id} sent to service and persisted. Text: \"${currentText.take(30)}...\"")
 
             } catch (e: Exception) {
                 Log.e(TAG, "Exception during sendMessage for packet ${optimisticPacketId}: ${e.message}", e)
@@ -276,69 +300,103 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun removeOptimisticMessage(packetId: UUID) {
+        Log.d(TAG, "Rolling back optimistic UI for message $packetId")
         _messages.update { list -> list.filterNot { it.id == packetId } }
     }
-
 
     private fun handleCommand(commandText: String) {
         val parts = commandText.drop(1).split(" ", limit = 2)
         val command = parts.firstOrNull()?.lowercase(Locale.getDefault())
         val args = if (parts.size > 1) parts[1] else null
-        Log.d(TAG, "Handling command: /$command, Args: $args")
-        // Implement command handling as in the provided original code
-        // (join, nick, create, id, clear, etc.)
-        // For brevity, not fully re-pasting here, but it should be similar.
+        Log.i(TAG, "Handling command: /$command, Args: $args")
+
         when (command) {
-            "join" -> args?.let { joinChannel(it.trim()) }
-            "nick" -> args?.let { newNick -> changeDisplayNameUserInitiated(newNick.trim()) } // Renamed for clarity
+            "join" -> args?.let { changeChannelByName(it.trim()) } // Use new name
+            "nick" -> args?.let { newNick -> changeDisplayNameUserInitiated(newNick.trim()) }
             "id" -> showMyId()
             "clear" -> clearCurrentChannelMessages()
-            // "create" -> args?.let { createChannel(it.trim()) } // Example
+            "announce" -> viewModelScope.launch { announceSelf() }
+            "createchannel" -> args?.let { requestCreateChannel(it.trim(), emptyList(), false, null) }
             else -> {
-                 addMessageToUi("System", "Unknown command: $command", false, _currentChannel.value)
+                 addMessageToUi("System", "Unknown command: /$command", false, _currentChannel.value)
+            }
+        }
+    }
+
+    fun requestCreateChannel(channelNameInput: String, memberPeerIds: List<String>, isPrivate: Boolean, passwordAttempt: String?) {
+        val effectiveChannelName = if (channelNameInput.startsWith("#")) channelNameInput else "#$channelNameInput"
+        Log.i(TAG, "User requested to create channel: Name='$effectiveChannelName', Members=${memberPeerIds.joinToString()}, Private=$isPrivate, PasswordSet=${passwordAttempt!=null}")
+
+        viewModelScope.launch(Dispatchers.IO) {
+            val existingChannel = channelRepository.getChannelByName(effectiveChannelName)
+            if (existingChannel != null) {
+                Log.w(TAG, "Channel '$effectiveChannelName' already exists. ID: ${existingChannel.id}")
+                _errorMessage.value = "Channel '$effectiveChannelName' already exists."
+                return@launch
+            }
+
+            // TODO: Hash password if private and passwordAttempt is not null
+            // val passwordHash = if (isPrivate && passwordAttempt != null) encryptionSvc.deriveKeyFromPassword(passwordAttempt.toCharArray(), encryptionSvc.generateSalt())?.encoded else null
+            // For now, ignoring password part for placeholder
+
+            val newChannel = ChannelInfo(
+                name = effectiveChannelName,
+                memberPeerIds = memberPeerIds, // In future, this would be from peer selection UI
+                isPrivate = isPrivate,
+                lastActivityTimestamp = System.currentTimeMillis() // New channel, current activity
+            )
+            channelRepository.addOrUpdateChannel(newChannel)
+            Log.i(TAG, "New channel '$effectiveChannelName' (ID: ${newChannel.id}) added to repository.")
+
+            // TODO: Send BitchatMessage.ChannelCreateRequest packet to the network
+            // For now, just locally add and switch
+            withContext(Dispatchers.Main) {
+                addMessageToUi("System", "Channel '$effectiveChannelName' created locally.", false, _currentChannel.value)
+                changeChannelByName(newChannel.name) // Switch to the newly created channel
             }
         }
     }
 
     private fun clearCurrentChannelMessages() {
         viewModelScope.launch {
+            Log.i(TAG, "Clearing messages for current channel: ${_currentChannel.value}")
             messageRepository.clearMessagesForChannel(_currentChannel.value)
             addMessageToUi("System", "Messages for ${_currentChannel.value} cleared.", false, _currentChannel.value)
         }
     }
 
     private fun showMyId() {
-        val pubKeyHex = currentUserPublicKey?.encoded?.joinToString("") { "%02x".format(it) } ?: "N/A"
-        addMessageToUi(
-            senderName = "System",
-            text = "Ephemeral ID: $ephemeralPeerId\nDisplay Name: ${displayName.value}\nPublic Key (Ed25519): ${pubKeyHex.take(16)}...",
-            isFromCurrentUser = false,
-            channel = _currentChannel.value
-        )
+        val pubKeyHex = currentUserPublicKey?.encoded?.joinToString("") { "%02x".format(it) } ?: "Not available"
+        val messageText = "Ephemeral ID: $ephemeralPeerId\nDisplay Name: ${displayName.value}\nPublic Key (Ed25519): ${pubKeyHex.take(16)}..."
+        Log.d(TAG, "Showing My ID: $messageText")
+        addMessageToUi("System", messageText, false, _currentChannel.value)
     }
 
-    private fun joinChannel(channelNameInput: String) {
+    fun changeChannelByName(channelNameInput: String) { // Renamed from joinChannel
         val targetChannel = if (channelNameInput.startsWith("#")) channelNameInput else "#$channelNameInput"
         if (_currentChannel.value == targetChannel) {
-            Log.d(TAG, "Already in channel: $targetChannel")
+            Log.d(TAG, "Already in channel: $targetChannel. No action taken.")
             return
         }
-        Log.i(TAG, "Joining channel: $targetChannel")
-        _currentChannel.value = targetChannel // Triggers message loading via flatMapLatest
+        Log.i(TAG, "User switching channel to: $targetChannel (from ${_currentChannel.value})")
+        _currentChannel.value = targetChannel
+        // Messages will update automatically due to flatMapLatest in observeCurrentChannelMessages
         addMessageToUi("System", "Switched to channel: $targetChannel", false, targetChannel)
-        // TODO: Send actual ChannelJoinRequest packet
+        // TODO: If joining a new channel not previously known, might need to send ChannelJoinRequest
     }
 
-    private fun changeDisplayNameUserInitiated(newName: String) { // Renamed from original example
-        if (newName.isNotBlank() && newName.length <= 30) {
-            viewModelScope.launch {
-                dataStorageService.saveDisplayName(newName)
-                _displayName.value = newName // Update local state immediately
-                addMessageToUi("System", "Display name changed to: $newName", false, _currentChannel.value)
-                announceSelf() // Announce the new display name
-            }
-        } else {
-             addMessageToUi("System", "Invalid display name. Must be 1-30 characters.", false, _currentChannel.value)
+    private fun changeDisplayNameUserInitiated(newName: String) {
+        if (newName.isBlank() || newName.length > 30) {
+            Log.w(TAG, "Invalid new display name attempt: '$newName'")
+            addMessageToUi("System", "Invalid display name. Must be 1-30 characters.", false, _currentChannel.value)
+            return
+        }
+        viewModelScope.launch {
+            Log.i(TAG, "User changing display name to: '$newName'")
+            dataStorageService.saveDisplayName(newName)
+            _displayName.value = newName
+            addMessageToUi("System", "Display name changed to: $newName", false, _currentChannel.value)
+            announceSelf()
         }
     }
 
@@ -348,10 +406,11 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         val sourceId = ephemeralPeerId
 
         if (pubKey == null || privKey == null ) {
-            Log.w(TAG, "Cannot announce self: keys not fully available.")
+            Log.e(TAG, "Cannot announce self: User keys not available (pubKey: ${pubKey!=null}, privKey: ${privKey!=null}).")
+            _errorMessage.value = "Cannot announce: Identity not ready."
             return
         }
-        Log.d(TAG, "Preparing to announce self. Name: ${_displayName.value}, ID: $sourceId")
+        Log.i(TAG, "Preparing to announce self. Name: '${_displayName.value}', ID: $sourceId, PubKey: ${pubKey.encoded.size}B")
 
         withContext(Dispatchers.IO) {
             try {
@@ -366,28 +425,30 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     _errorMessage.value = "Error: Could not prepare self-announcement."
                     return@withContext
                 }
+                Log.d(TAG, "Announce message serialized to ${serializedAnnouncePayload.size} bytes for self-announce.")
 
                 val packet = BitchatPacket(
                     sourceId = sourceId,
-                    message = announceMessage, // Keep the object for context
-                    messagePayloadBytes = serializedAnnouncePayload, // Crucial for dataToSign
+                    message = announceMessage,
+                    messagePayloadBytes = serializedAnnouncePayload,
                     ttl = 2
                 )
 
-                val dataToSign = packet.dataToSign() // Uses packet.messagePayloadBytes
+                val dataToSign = packet.dataToSign()
                 packet.signature = encryptionSvc.signEd25519(dataToSign, privKey)
                 if (packet.signature == null) {
-                    Log.e(TAG, "Failed to sign self-announce packet.")
+                    Log.e(TAG, "Failed to sign self-announce packet ID ${packet.id}.")
                     _errorMessage.value = "Error: Could not sign self-announcement."
                     return@withContext
                 }
+                Log.d(TAG, "Self-announce packet ${packet.id} signed.")
 
                 val finalPacketBytes = BinaryProtocol.serializePacket(packet, encryptionSvc)
                 if (finalPacketBytes != null) {
                     bluetoothMeshService?.sendDataToPeers(finalPacketBytes, packet)
-                    Log.i(TAG, "Sent self-announce message for $sourceId.")
+                    Log.i(TAG, "Sent self-announce message for $sourceId (Packet ID: ${packet.id}, Size: ${finalPacketBytes.size}B).")
                 } else {
-                    Log.e(TAG, "Failed to serialize self-announce packet.")
+                    Log.e(TAG, "Failed to serialize self-announce packet ${packet.id}.")
                     _errorMessage.value = "Error: Could not serialize self-announcement packet."
                 }
             } catch (e: Exception) {
@@ -397,93 +458,92 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-
     fun onPacketReceived(packet: BitchatPacket) {
-        Log.d(TAG, "Packet received in ViewModel: ID=${packet.id}, From=${packet.sourceId}, Type=${packet.message::class.simpleName}, PayloadSize=${packet.messagePayloadBytes?.size ?: "N/A"}")
-
+        Log.i(TAG, "Packet received in ViewModel: ID=${packet.id}, From=${packet.sourceId}, Type=${packet.message::class.simpleName}, PayloadSize=${packet.messagePayloadBytes?.size ?: "N/A"}")
         viewModelScope.launch(Dispatchers.IO) {
             try {
-                // 1. Store public key if it's an Announce message
+                if (packet.sourceId == ephemeralPeerId) {
+                    Log.d(TAG, "Ignoring packet ${packet.id} from self.")
+                    return@launch
+                }
+
                 if (packet.message is BitchatMessage.Announce) {
                     val announceMsg = packet.message as BitchatMessage.Announce
                     if (announceMsg.publicKey.isNotEmpty()) {
-                        Log.i(TAG, "Processing Announce from ${announceMsg.peerId} (${announceMsg.displayName}). Storing public key.")
+                        Log.i(TAG, "Processing Announce from ${announceMsg.peerId} ('${announceMsg.displayName}'). Storing public key (${announceMsg.publicKey.size}B).")
                         dataStorageService.savePeerPublicKey(announceMsg.peerId, announceMsg.publicKey)
                     } else {
                         Log.w(TAG, "Received Announce from ${announceMsg.peerId} but its public key was empty.")
                     }
                 }
 
-                // 2. Verify signature
                 if (packet.signature == null) {
-                    Log.w(TAG, "Packet ${packet.id} from ${packet.sourceId} has no signature. Processing cautiously or dropping if not Announce.")
-                    if (packet.message !is BitchatMessage.Announce) return@launch // Drop non-announce unsigned packets
+                    Log.w(TAG, "Packet ${packet.id} from ${packet.sourceId} (Type: ${packet.message::class.simpleName}) has no signature. Processing depending on type.")
+                    if (packet.message !is BitchatMessage.Announce) {
+                        Log.w(TAG, "Packet ${packet.id} is not Announce and has no signature. Dropping.")
+                        return@launch
+                    }
                 } else {
                     val senderPublicKeyBytes = dataStorageService.getPeerPublicKey(packet.sourceId)
                     if (senderPublicKeyBytes == null) {
-                        Log.w(TAG, "No public key found for peer ${packet.sourceId} to verify packet ${packet.id}. Dropped (unless Announce, already processed key).")
-                        if (packet.message !is BitchatMessage.Announce) return@launch
-                        // If it's an Announce, we might have just stored its key. Verification might be against the key it carries.
-                        // This part could be complex depending on trust model for first contact.
-                        // For now, if it's Announce and we had no key, we assume it's a new peer and proceed.
+                        Log.w(TAG, "No public key found for peer ${packet.sourceId} to verify packet ${packet.id} (Type: ${packet.message::class.simpleName}).")
+                        if (packet.message !is BitchatMessage.Announce) {
+                             Log.w(TAG, "Dropping non-Announce packet ${packet.id} due to missing sender public key for verification.")
+                            return@launch
+                        }
+                        Log.i(TAG, "Allowing Announce packet ${packet.id} from new peer ${packet.sourceId} for key discovery, even if prior key unknown for sig check.")
                     } else {
                         val senderPublicKey = encryptionSvc.getEd25519PublicKeyFromBytes(senderPublicKeyBytes)
                         if (senderPublicKey == null) {
-                            Log.e(TAG, "Could not reconstruct public key for peer ${packet.sourceId} from stored bytes. Packet ${packet.id} dropped.")
+                            Log.e(TAG, "Could not reconstruct public key for peer ${packet.sourceId} from stored bytes. Packet ${packet.id} (Type: ${packet.message::class.simpleName}) dropped.")
                             return@launch
                         }
-                        // packet.messagePayloadBytes should have been populated by BinaryProtocol.deserializePacket
-                        val dataForVerification = packet.dataToSign() // Uses packet.messagePayloadBytes
+                        val dataForVerification = packet.dataToSign()
                         if (!encryptionSvc.verifyEd25519(dataForVerification, packet.signature!!, senderPublicKey)) {
                             Log.w(TAG, "Packet signature verification FAILED for ${packet.id} from ${packet.sourceId}. Type: ${packet.message::class.simpleName}")
                             return@launch
                         }
-                        Log.i(TAG, "Packet signature VERIFIED for ${packet.id} from ${packet.sourceId}")
+                        Log.i(TAG, "Packet signature VERIFIED for ${packet.id} from ${packet.sourceId} (Type: ${packet.message::class.simpleName})")
                     }
                 }
 
-                // 3. Process the message content
                 val receivedMessage = packet.message
                 when (receivedMessage) {
                     is BitchatMessage.UserMessage -> {
-                        Log.i(TAG, "Processing UserMessage from ${receivedMessage.senderDisplayName} in #${receivedMessage.channel}: ${receivedMessage.text.take(30)}...")
+                        Log.i(TAG, "Processing UserMessage from '${receivedMessage.senderDisplayName}' in #${receivedMessage.channel}: \"${receivedMessage.text.take(30)}...\"")
                         val uiMsg = UiMessage(
                             id = packet.id,
                             senderName = receivedMessage.senderDisplayName,
                             text = receivedMessage.text,
                             timestamp = packet.timestamp,
-                            isFromCurrentUser = (packet.sourceId == ephemeralPeerId),
+                            isFromCurrentUser = false,
                             channel = receivedMessage.channel
                         )
                         messageRepository.saveMessage(receivedMessage.channel, uiMsg)
+                        channelRepository.updateChannelLastActivity(receivedMessage.channel, packet.timestamp) // Update channel activity
+                        Log.d(TAG, "UserMessage ${packet.id} saved for channel ${receivedMessage.channel} & activity updated.")
 
                         val mainActivity = getApplication<Application>() as? MainActivity
-                        val appInForeground = mainActivity?.isAppInForeground ?: true // Assume foreground if unknown
+                        val appInForeground = mainActivity?.isAppInForeground ?: true
 
-                        if (!uiMsg.isFromCurrentUser && (!appInForeground || _currentChannel.value != uiMsg.channel)) {
-                            notificationService.showNewMessageNotification(
-                                uiMsg.senderName,
-                                uiMsg.text,
-                                uiMsg.channel
-                            )
+                        if (!appInForeground || _currentChannel.value != uiMsg.channel) {
+                            Log.d(TAG, "Showing notification for message ${packet.id} in channel ${uiMsg.channel} (App BG: ${!appInForeground}, Diff Chan: ${_currentChannel.value != uiMsg.channel})")
+                            notificationService.showNewMessageNotification(uiMsg.senderName, uiMsg.text, uiMsg.channel)
                         }
                     }
                     is BitchatMessage.Announce -> {
-                        // Key already stored. Log additional info or update peer list UI if any.
-                        addMessageToUi("System", "Peer Announcement: ${receivedMessage.displayName} (${receivedMessage.peerId.take(8)}...) is on the network.", false, _currentChannel.value)
+                        addMessageToUi("System", "Peer Online: ${receivedMessage.displayName} (${receivedMessage.peerId.take(8)}...)", false, _currentChannel.value)
                     }
-                    // ... other BitchatMessage types from original file ...
                     is BitchatMessage.Ack -> {
-                        Log.i(TAG, "ACK received for our message: ${receivedMessage.messageId}")
+                        Log.i(TAG, "ACK received for our message ID: ${receivedMessage.messageId}")
                         messageMetadataService?.onAckReceived(receivedMessage.messageId)
-                        _isSendingMessage.value = false // Assuming ACK means message fully sent for this example
                     }
                     else -> {
-                        Log.d(TAG, "Received unhandled BitchatMessage type in onPacketReceived: ${receivedMessage::class.simpleName}")
+                        Log.d(TAG, "Received unhandled BitchatMessage type: ${receivedMessage::class.simpleName} from ${packet.sourceId}")
                     }
                 }
             } catch (e: Exception) {
-                Log.e(TAG, "Error processing received packet ${packet.id}: ${e.message}", e)
+                Log.e(TAG, "Error processing received packet ${packet.id} from ${packet.sourceId}: ${e.message}", e)
                 _errorMessage.value = "Receive Error: ${e.message ?: "Unknown error"}"
             }
         }
@@ -491,69 +551,71 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     private fun addMessageToUi(senderName: String, text: String, isFromCurrentUser: Boolean, channel: String) {
         val uiMsg = UiMessage(
-            senderName = senderName,
-            text = text,
+            senderName = senderName, text = text,
             timestamp = System.currentTimeMillis(),
-            isFromCurrentUser = isFromCurrentUser,
-            channel = channel
+            isFromCurrentUser = isFromCurrentUser, channel = channel
         )
-        // Add to the specific channel's list if different from current, or directly if current
         if (channel == _currentChannel.value) {
             _messages.update { currentList -> (currentList + uiMsg).sortedBy { it.timestamp } }
         } else {
-            // If message is for a non-active channel, it's saved by onPacketReceived->messageRepository
-            // This helper is more for system messages in the *current* channel.
-            Log.d(TAG, "addMessageToUi called for non-current channel $channel, message: $text. Not adding to current UI.")
+            Log.d(TAG, "System message for non-active channel '$channel': \"$text\". Not adding to current UI of '${_currentChannel.value}'.")
         }
     }
 
     fun setBluetoothServices(service: BluetoothMeshService) {
+        Log.i(TAG, "BluetoothMeshService instance being set in ViewModel.")
         this.bluetoothMeshService = service
-        this.messageMetadataService = MessageMetadataService(service, viewModelScope) // Pass scope
-        Log.d(TAG, "BluetoothMeshService and MessageMetadataService instances set in ViewModel.")
+        this.messageMetadataService = MessageMetadataService(service, viewModelScope)
         observeBluetoothServiceStates(service)
-        observeMessageStatusUpdates() // For sent messages
-        observeIncomingRawPackets(service) // For received messages
+        observeMessageStatusUpdates()
+        observeIncomingRawPackets(service)
+        viewModelScope.launch {
+            delay(500)
+            service.initializeBleOperations()
+        }
     }
 
     private fun observeBluetoothServiceStates(service: BluetoothMeshService) {
-        service.isScanning
-            .onEach { scanning -> _isBluetoothReady.value = scanning || (bluetoothMeshService?.isAdvertising?.value ?: false) }
+        Log.d(TAG, "Observing Bluetooth service states.")
+        service.bleOperationState
+            .onEach { state ->
+                _bleOperationState.value = state
+                Log.i(TAG, "BLE Operation State in ViewModel updated to: $state")
+            }
+            .catch {e -> Log.e(TAG, "Error in bleOperationState flow: ${e.message}", e)}
             .launchIn(viewModelScope)
-        service.isAdvertising
-            .onEach { advertising -> _isBluetoothReady.value = advertising || (bluetoothMeshService?.isScanning?.value ?: false) }
-            .launchIn(viewModelScope)
-        service.connectedDevices
+
+        service.connectedGattClientDevices
+            .map { it.values.map { gatt -> gatt.device } }
             .onEach { peers -> _connectedPeers.value = peers }
+            .catch {e -> Log.e(TAG, "Error in connectedGattClientDevices flow: ${e.message}", e)}
             .launchIn(viewModelScope)
     }
 
     private fun observeIncomingRawPackets(service: BluetoothMeshService) {
-         service.processedReceivedPacketsFlow // Assuming this flow exists in BluetoothMeshService
-            .onEach { packet -> onPacketReceived(packet) } // packet is BitchatPacket
+         service.processedReceivedPacketsFlow
+            .onEach { packet -> onPacketReceived(packet) }
             .catch { e -> Log.e(TAG, "Error in processedReceivedPacketsFlow: ${e.message}", e) }
             .launchIn(viewModelScope)
-        Log.d(TAG, "Started observing processed packets from Bluetooth service.")
+        Log.d(TAG, "Observation of processed packets from Bluetooth service started.")
     }
-
 
     private fun observeMessageStatusUpdates() {
         messageMetadataService?.messageStatusUpdates?.onEach { (messageId, status) ->
-            Log.d(TAG, "Message $messageId status update: $status")
+            Log.d(TAG, "Message $messageId UI status update: $status")
             if (status == MessageMetadataService.MessageStatus.SENT_AWAITING_ACK ||
                 status == MessageMetadataService.MessageStatus.DELIVERED ||
                 status == MessageMetadataService.MessageStatus.FAILED_NO_ACK ||
                 status == MessageMetadataService.MessageStatus.FAILED_TO_SEND) {
-                _isSendingMessage.value = false // Stop sending indicator once it's definitively sent or failed.
+                if (_isSendingMessage.value) _isSendingMessage.value = false
             }
-            // Update UI based on message status (e.g., show delivery ticks or failure notice)
              _messages.update { currentMessages ->
                 currentMessages.map { uiMsg ->
                     if (uiMsg.id == messageId) {
                         when (status) {
                             MessageMetadataService.MessageStatus.FAILED_NO_ACK,
                             MessageMetadataService.MessageStatus.FAILED_TO_SEND -> uiMsg.copy(text = "${uiMsg.text} (Failed)")
-                            MessageMetadataService.MessageStatus.DELIVERED -> uiMsg.copy(text = "${uiMsg.text} (Delivered ✓)") // Example tick
+                            MessageMetadataService.MessageStatus.DELIVERED -> uiMsg.copy(text = "${uiMsg.text} (Delivered ✓)")
                             else -> uiMsg
                         }
                     } else {
@@ -564,7 +626,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             if (status == MessageMetadataService.MessageStatus.FAILED_NO_ACK || status == MessageMetadataService.MessageStatus.FAILED_TO_SEND){
                  _errorMessage.value = "Message ${messageId.toString().take(8)}... failed to send."
             }
-        }?.launchIn(viewModelScope)
+        }
+        ?.catch {e -> Log.e(TAG, "Error in messageStatusUpdates flow: ${e.message}", e)}
+        ?.launchIn(viewModelScope)
     }
 
     fun clearErrorMessage() {
@@ -574,6 +638,6 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     override fun onCleared() {
         super.onCleared()
         messageMetadataService?.destroy()
-        Log.d(TAG, "ChatViewModel onCleared.")
+        Log.i(TAG, "ChatViewModel onCleared. Instance: ${this.hashCode()}")
     }
 }
